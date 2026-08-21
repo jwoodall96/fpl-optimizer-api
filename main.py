@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 import requests
+import math
 
 app = FastAPI(
     title="FPL Optimizer API",
@@ -1681,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.0-core-fpl"
+MODEL_VERSION_V3 = "3.1-core-fpl-fixture-cs"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -1817,6 +1818,162 @@ def adjust_minutes_for_current_availability(player, baseline_minutes):
         "adjustment_reason": adjustment_reason,
     }
 
+
+def get_historical_team_full_strength_lookup(season="2025-26"):
+    """
+    V1.5: historical home/away attack and defence strengths keyed by team name.
+
+    Strength 1.0 = league average.
+    Defence weakness > 1.0 = concedes more than league average.
+    """
+    url = f"{HISTORICAL_BASE}/{season}/fixtures.csv"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(csv.DictReader(io.StringIO(response.content.decode("utf-8"))))
+    team_names = get_historical_team_mapping(season)
+
+    teams = {}
+
+    def ensure_team(team_id):
+        if team_id not in teams:
+            teams[team_id] = {
+                "home_games": 0,
+                "away_games": 0,
+                "home_gf": 0,
+                "away_gf": 0,
+                "home_ga": 0,
+                "away_ga": 0,
+            }
+
+    total_home_goals = 0
+    total_away_goals = 0
+    matches = 0
+
+    for row in rows:
+        try:
+            home = int(row["team_h"])
+            away = int(row["team_a"])
+            hg = int(row["team_h_score"])
+            ag = int(row["team_a_score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        ensure_team(home)
+        ensure_team(away)
+
+        teams[home]["home_games"] += 1
+        teams[home]["home_gf"] += hg
+        teams[home]["home_ga"] += ag
+
+        teams[away]["away_games"] += 1
+        teams[away]["away_gf"] += ag
+        teams[away]["away_ga"] += hg
+
+        total_home_goals += hg
+        total_away_goals += ag
+        matches += 1
+
+    league_home_goals = total_home_goals / matches if matches else 1.0
+    league_away_goals = total_away_goals / matches if matches else 1.0
+
+    lookup = {}
+
+    for team_id, values in teams.items():
+        name = team_names.get(team_id)
+        if not name:
+            continue
+
+        home_games = values["home_games"]
+        away_games = values["away_games"]
+
+        home_gf = values["home_gf"] / home_games if home_games else league_home_goals
+        away_gf = values["away_gf"] / away_games if away_games else league_away_goals
+        home_ga = values["home_ga"] / home_games if home_games else league_away_goals
+        away_ga = values["away_ga"] / away_games if away_games else league_home_goals
+
+        lookup[name.strip().lower()] = {
+            "historical_team_id": team_id,
+            "home_attack_strength": home_gf / league_home_goals if league_home_goals else 1.0,
+            "away_attack_strength": away_gf / league_away_goals if league_away_goals else 1.0,
+            "home_defence_weakness": home_ga / league_away_goals if league_away_goals else 1.0,
+            "away_defence_weakness": away_ga / league_home_goals if league_home_goals else 1.0,
+        }
+
+    return {
+        "league_home_goals": league_home_goals,
+        "league_away_goals": league_away_goals,
+        "teams": lookup,
+    }
+
+
+def fixture_clean_sheet_probability(
+    player_team_name,
+    opponent_name,
+    player_is_home,
+    full_strength_lookup,
+):
+    """
+    V1.5 fixture-specific team clean-sheet probability.
+
+    Expected opponent goals =
+        venue league scoring rate
+        * opponent attack strength
+        * player's team defensive weakness
+
+    P(clean sheet) = exp(-expected opponent goals).
+
+    Current-only/promoted teams use neutral attack strength (1.0) and
+    PROMOTED_DEFENCE_WEAKNESS for their own defence.
+    """
+    teams = full_strength_lookup["teams"]
+
+    own = teams.get((player_team_name or "").strip().lower())
+    opponent = teams.get((opponent_name or "").strip().lower())
+
+    if player_is_home:
+        league_rate = full_strength_lookup["league_away_goals"]
+        opponent_attack = (
+            opponent["away_attack_strength"] if opponent else 1.0
+        )
+        own_defence_weakness = (
+            own["home_defence_weakness"]
+            if own
+            else PROMOTED_DEFENCE_WEAKNESS
+        )
+        basis = "opponent away attack x team home defence"
+    else:
+        league_rate = full_strength_lookup["league_home_goals"]
+        opponent_attack = (
+            opponent["home_attack_strength"] if opponent else 1.0
+        )
+        own_defence_weakness = (
+            own["away_defence_weakness"]
+            if own
+            else PROMOTED_DEFENCE_WEAKNESS
+        )
+        basis = "opponent home attack x team away defence"
+
+    expected_goals_conceded = max(
+        0.0,
+        league_rate * opponent_attack * own_defence_weakness,
+    )
+    probability = math.exp(-expected_goals_conceded)
+
+    return {
+        "clean_sheet_probability": max(0.0, min(probability, 1.0)),
+        "expected_goals_conceded": expected_goals_conceded,
+        "clean_sheet_basis": basis,
+        "opponent_attack_strength": opponent_attack,
+        "team_defence_weakness": own_defence_weakness,
+        "opponent_promoted_assumption": opponent is None,
+        "team_promoted_assumption": own is None,
+    }
+
+
 def calculate_core_projection(
     position_id,
     xg_per90,
@@ -1828,6 +1985,7 @@ def calculate_core_projection(
     expected_minutes,
     attack_multiplier=1.0,
     clean_sheet_multiplier=1.0,
+    fixture_clean_sheet_probability=None,
 ):
     """
     V3 expected FPL points for one fixture.
@@ -1881,17 +2039,14 @@ def calculate_core_projection(
         expected_assists * 3
     )
 
-    # Historical clean_sheets_per90 is being used
-    # as an approximate clean-sheet probability.
-    cs_probability = (
-        clean_sheets_per90
-        * clean_sheet_multiplier
-    )
+    # V1.5: prefer a fixture-specific team clean-sheet probability.
+    # Historical clean-sheet rate remains as a backwards-compatible fallback.
+    if fixture_clean_sheet_probability is not None:
+        cs_probability = float(fixture_clean_sheet_probability)
+    else:
+        cs_probability = clean_sheets_per90 * clean_sheet_multiplier
 
-    cs_probability = max(
-        0.0,
-        min(cs_probability, 1.0)
-    )
+    cs_probability = max(0.0, min(cs_probability, 1.0))
 
     # CS points require 60+ minutes.
     if expected_minutes >= 60:
@@ -2020,6 +2175,8 @@ def player_projection_v3(
         for t in current["teams"]
     }
 
+    full_team_strength = get_historical_team_full_strength_lookup()
+
     history_lookup = get_historical_lookup_by_code()
 
     historical = history_lookup.get(
@@ -2079,6 +2236,13 @@ def player_projection_v3(
             fixture["opponent_id"]
         )
 
+        
+        cs_info = fixture_clean_sheet_probability(
+            player_team_name=current_teams.get(player["team"]),
+            opponent_name=opponent_name,
+            player_is_home=fixture["home"],
+            full_strength_lookup=full_team_strength,
+        )
         opponent_strength = (
             strength_lookup.get(
                 opponent_name.strip().lower()
@@ -2166,6 +2330,7 @@ def player_projection_v3(
 
             clean_sheet_multiplier=
                 cs_multiplier,
+            fixture_clean_sheet_probability=cs_info["clean_sheet_probability"],
         )
 
         projections.append({
@@ -2499,6 +2664,14 @@ def project_player_for_optimizer(
         gw_projections.append({
             "gameweek": fixture["gameweek"],
             "opponent": opponent_name,
+            "expected_goals_conceded": round(cs_info["expected_goals_conceded"], 3),
+            "clean_sheet_basis": cs_info["clean_sheet_basis"],
+            "opponent_attack_strength": round(cs_info["opponent_attack_strength"], 3),
+            "team_defence_weakness": round(cs_info["team_defence_weakness"], 3),
+            "clean_sheet_promoted_assumption": (
+                cs_info["opponent_promoted_assumption"]
+                or cs_info["team_promoted_assumption"]
+            ),
             "home": fixture["home"],
             "xpts": projection["total_xpts"],
         })
