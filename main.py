@@ -1290,3 +1290,357 @@ def team_mapping(season: str = "2025-26"):
         "historical_only": historical_only,
         "current_only": current_only,
     }
+
+# ============================================================
+# PROJECTION ENGINE V2 - FIXTURE ADJUSTMENT
+# ============================================================
+
+MODEL_VERSION_V2 = "2.0-fixture-adjusted"
+
+PROMOTED_DEFENCE_WEAKNESS = 1.10
+
+
+def get_historical_team_strength_lookup(
+    season="2025-26",
+):
+    """
+    Build historical defensive-strength data keyed by team name.
+    """
+
+    fixture_url = (
+        f"{HISTORICAL_BASE}/{season}/fixtures.csv"
+    )
+
+    response = requests.get(
+        fixture_url,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
+            )
+        )
+    )
+
+    team_names = get_historical_team_mapping(
+        season
+    )
+
+    teams = {}
+
+    def ensure_team(team_id):
+        if team_id not in teams:
+            teams[team_id] = {
+                "home_games": 0,
+                "away_games": 0,
+                "home_ga": 0,
+                "away_ga": 0,
+            }
+
+    total_home_goals = 0
+    total_away_goals = 0
+    matches = 0
+
+    for row in rows:
+        try:
+            home = int(row["team_h"])
+            away = int(row["team_a"])
+            hg = int(row["team_h_score"])
+            ag = int(row["team_a_score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        ensure_team(home)
+        ensure_team(away)
+
+        teams[home]["home_games"] += 1
+        teams[home]["home_ga"] += ag
+
+        teams[away]["away_games"] += 1
+        teams[away]["away_ga"] += hg
+
+        total_home_goals += hg
+        total_away_goals += ag
+        matches += 1
+
+    league_home_goals = (
+        total_home_goals / matches
+        if matches else 0
+    )
+
+    league_away_goals = (
+        total_away_goals / matches
+        if matches else 0
+    )
+
+    lookup = {}
+
+    for team_id, values in teams.items():
+
+        name = team_names.get(team_id)
+
+        if not name:
+            continue
+
+        home_ga_pg = (
+            values["home_ga"]
+            / values["home_games"]
+            if values["home_games"]
+            else league_away_goals
+        )
+
+        away_ga_pg = (
+            values["away_ga"]
+            / values["away_games"]
+            if values["away_games"]
+            else league_home_goals
+        )
+
+        lookup[name.strip().lower()] = {
+            "historical_team_id": team_id,
+            "home_defence_weakness": (
+                home_ga_pg / league_away_goals
+                if league_away_goals else 1.0
+            ),
+            "away_defence_weakness": (
+                away_ga_pg / league_home_goals
+                if league_home_goals else 1.0
+            ),
+        }
+
+    return lookup
+
+
+@app.get("/projection-v2/{player_id}")
+def player_projection_v2(
+    player_id: int,
+    expected_minutes: float = 75,
+    start_gw: int = 1,
+    horizon: int = 6,
+):
+    """
+    Fixture-adjusted attacking projection.
+
+    V2 adjusts historical player xG/xA rates using the
+    opponent's historical home/away defensive weakness.
+    """
+
+    horizon = max(1, min(horizon, 10))
+
+    current = get_bootstrap()
+
+    player = next(
+        (
+            p for p in current["elements"]
+            if p["id"] == player_id
+        ),
+        None,
+    )
+
+    if player is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Current FPL player not found",
+        )
+
+    current_teams = {
+        t["id"]: t["name"]
+        for t in current["teams"]
+    }
+
+    history_lookup = get_historical_lookup()
+
+    historical = history_lookup.get(
+        player["web_name"].strip().lower()
+    )
+
+    if historical is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No historical player match found",
+        )
+
+    history_minutes = safe_int(
+        historical.get("minutes")
+    )
+
+    if history_minutes <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No usable historical minutes",
+        )
+
+    history_xg = safe_float(
+        historical.get("expected_goals")
+    )
+
+    history_xa = safe_float(
+        historical.get("expected_assists")
+    )
+
+    base_xg_per90 = (
+        history_xg / history_minutes * 90
+    )
+
+    base_xa_per90 = (
+        history_xa / history_minutes * 90
+    )
+
+    strength_lookup = (
+        get_historical_team_strength_lookup()
+    )
+
+    fixtures = get_player_fixtures(
+        player["team"],
+        start_gw=start_gw,
+        horizon=horizon,
+    )
+
+    projections = []
+
+    for fixture in fixtures:
+
+        opponent_name = current_teams.get(
+            fixture["opponent_id"]
+        )
+
+        historical_strength = (
+            strength_lookup.get(
+                opponent_name.strip().lower()
+            )
+            if opponent_name
+            else None
+        )
+
+        if historical_strength:
+
+            # Player at home -> opponent is away.
+            if fixture["home"]:
+                multiplier = (
+                    historical_strength[
+                        "away_defence_weakness"
+                    ]
+                )
+                basis = (
+                    "opponent historical "
+                    "away defence"
+                )
+
+            # Player away -> opponent is home.
+            else:
+                multiplier = (
+                    historical_strength[
+                        "home_defence_weakness"
+                    ]
+                )
+                basis = (
+                    "opponent historical "
+                    "home defence"
+                )
+
+            promoted_assumption = False
+
+        else:
+            multiplier = (
+                PROMOTED_DEFENCE_WEAKNESS
+            )
+            basis = (
+                "promoted-team default assumption"
+            )
+            promoted_assumption = True
+
+        adjusted_xg_per90 = (
+            base_xg_per90 * multiplier
+        )
+
+        adjusted_xa_per90 = (
+            base_xa_per90 * multiplier
+        )
+
+        projection = (
+            calculate_unadjusted_projection(
+                position_id=
+                    player["element_type"],
+                xg_per90=adjusted_xg_per90,
+                xa_per90=adjusted_xa_per90,
+                expected_minutes=
+                    expected_minutes,
+            )
+        )
+
+        projections.append({
+            **fixture,
+            "opponent": opponent_name,
+            "fixture_multiplier":
+                round(multiplier, 3),
+            "multiplier_basis": basis,
+            "promoted_assumption":
+                promoted_assumption,
+            "base_xg_per90":
+                round(base_xg_per90, 3),
+            "base_xa_per90":
+                round(base_xa_per90, 3),
+            "adjusted_xg_per90":
+                round(adjusted_xg_per90, 3),
+            "adjusted_xa_per90":
+                round(adjusted_xa_per90, 3),
+            **projection,
+        })
+
+    total_xpts = sum(
+        p["total_xpts"]
+        for p in projections
+    )
+
+    return {
+        "model_version": MODEL_VERSION_V2,
+        "model_type":
+            "fixture-adjusted attacking projection",
+        "player": {
+            "id": player["id"],
+            "name": player["web_name"],
+            "team":
+                current_teams.get(
+                    player["team"]
+                ),
+            "position_id":
+                player["element_type"],
+            "price":
+                player["now_cost"] / 10,
+        },
+        "historical_basis": {
+            "season": "2025-26",
+            "minutes": history_minutes,
+            "xg_per90":
+                round(base_xg_per90, 3),
+            "xa_per90":
+                round(base_xa_per90, 3),
+        },
+        "assumptions": {
+            "expected_minutes":
+                expected_minutes,
+            "promoted_team_defence_weakness":
+                PROMOTED_DEFENCE_WEAKNESS,
+            "fixture_adjustment": True,
+        },
+        "fixtures": projections,
+        "totals": {
+            "fixtures": len(projections),
+            "total_xpts":
+                round(total_xpts, 3),
+        },
+        "still_missing": [
+            "clean-sheet points",
+            "goalkeeper saves",
+            "defensive contributions",
+            "bonus",
+            "GW-specific expected minutes",
+            "current-season team-strength adjustment",
+        ],
+    }
