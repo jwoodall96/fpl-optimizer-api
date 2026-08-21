@@ -1644,3 +1644,35 @@ def player_projection_v2(
             "current-season team-strength adjustment",
         ],
     }
+
+@app.get("/historical-fields")
+def historical_fields(
+    season: str = "2025-26",
+):
+    """
+    Show available columns in archived players_raw.csv.
+    """
+    url = (
+        f"{HISTORICAL_BASE}/"
+        f"{season}/players_raw.csv"
+    )
+
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    reader = csv.DictReader(
+        io.StringIO(
+            response.content.decode("utf-8")
+        )
+    )
+
+    return {
+        "season": season,
+        "field_count": len(
+            reader.fieldnames or []
+        ),
+        "fields": reader.fieldnames or [],
+    }
