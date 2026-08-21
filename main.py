@@ -235,3 +235,70 @@ def fixtures(gameweek: int | None = None):
         "count": len(fixtures_data),
         "fixtures": fixtures_data
     }
+
+HISTORICAL_BASE = (
+    "https://raw.githubusercontent.com/"
+    "vaastav/Fantasy-Premier-League/master/data"
+)
+
+
+@app.get("/history/{season}")
+def historical_players(season: str, limit: int = 50):
+    """
+    Return archived player data for a previous FPL season.
+    Example season: 2025-26
+    """
+    limit = max(1, min(limit, 100))
+
+    url = (
+        f"{HISTORICAL_BASE}/{season}/players_raw.csv"
+    )
+
+    response = requests.get(url, timeout=30)
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Historical data not found for season {season}"
+        )
+
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(io.StringIO(response.text))
+    )
+
+    result = []
+
+    for p in rows[:limit]:
+        result.append({
+            "id": p.get("id"),
+            "first_name": p.get("first_name"),
+            "second_name": p.get("second_name"),
+            "web_name": p.get("web_name"),
+            "team": p.get("team"),
+            "element_type": p.get("element_type"),
+            "minutes": p.get("minutes"),
+            "total_points": p.get("total_points"),
+            "goals_scored": p.get("goals_scored"),
+            "assists": p.get("assists"),
+            "expected_goals": p.get("expected_goals"),
+            "expected_assists": p.get("expected_assists"),
+            "expected_goal_involvements":
+                p.get("expected_goal_involvements"),
+            "expected_goals_conceded":
+                p.get("expected_goals_conceded"),
+            "clean_sheets": p.get("clean_sheets"),
+            "saves": p.get("saves"),
+            "bonus": p.get("bonus"),
+            "bps": p.get("bps"),
+        })
+
+    return {
+        "season": season,
+        "count": len(result),
+        "players": result,
+    }
