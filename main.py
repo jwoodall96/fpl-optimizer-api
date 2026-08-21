@@ -1186,3 +1186,107 @@ def historical_team_strength(
         },
         "teams": result,
     }
+def get_historical_team_mapping(season="2025-26"):
+    """
+    Map historical FPL team IDs to team names.
+    """
+    url = f"{HISTORICAL_BASE}/{season}/teams.csv"
+
+    response = requests.get(url, timeout=30)
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Historical teams not found for {season}",
+        )
+
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
+            )
+        )
+    )
+
+    mapping = {}
+
+    for row in rows:
+        try:
+            team_id = int(row["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        name = (
+            row.get("name")
+            or row.get("team")
+            or ""
+        ).strip()
+
+        if name:
+            mapping[team_id] = name
+
+    return mapping
+
+@app.get("/team-mapping")
+def team_mapping(season: str = "2025-26"):
+    """
+    Safely match historical Premier League teams to the
+    current FPL season by team name rather than team ID.
+    """
+    historical = get_historical_team_mapping(season)
+
+    current = get_bootstrap()
+
+    current_by_name = {
+        team["name"].strip().lower(): team
+        for team in current["teams"]
+    }
+
+    matched = []
+    historical_only = []
+
+    for historical_id, historical_name in historical.items():
+
+        current_team = current_by_name.get(
+            historical_name.strip().lower()
+        )
+
+        if current_team:
+            matched.append({
+                "historical_team_id": historical_id,
+                "historical_name": historical_name,
+                "current_team_id": current_team["id"],
+                "current_name": current_team["name"],
+            })
+        else:
+            historical_only.append({
+                "historical_team_id": historical_id,
+                "historical_name": historical_name,
+            })
+
+    historical_names = {
+        name.strip().lower()
+        for name in historical.values()
+    }
+
+    current_only = []
+
+    for team in current["teams"]:
+        if team["name"].strip().lower() not in historical_names:
+            current_only.append({
+                "current_team_id": team["id"],
+                "current_name": team["name"],
+            })
+
+    return {
+        "historical_season": season,
+        "matched_count": len(matched),
+        "matched": matched,
+        "historical_only": historical_only,
+        "current_only": current_only,
+    }
