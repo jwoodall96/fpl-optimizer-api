@@ -1833,10 +1833,14 @@ def calculate_core_projection(
         expected_saves = 0.0
         save_xpts = 0.0
 
-    defcon_xpts = (
+    # Defensive contribution is a raw count, not FPL points. 
+    # V3 does not yet convert the threshold-based rule into xPts.
+    expected_defcon = (
         defcon_points_per90
         * minutes_factor
     )
+
+    defcon_xpts = 0.0
 
     bonus_xpts = (
         bonus_per90
@@ -1883,6 +1887,8 @@ def calculate_core_projection(
 
         "save_xpts":
             round(save_xpts, 3),
+        "expected_defensive_contributions":
+            round(expected_defcon, 3),
 
         "defcon_xpts":
             round(defcon_xpts, 3),
