@@ -243,7 +243,15 @@ HISTORICAL_BASE = (
 
 
 @app.get("/history/{season}")
-def historical_players(season: str, limit: int = 50):
+def historical_players(
+    season: str,
+    player: str | None = None,
+    position: int | None = None,
+    min_minutes: int = 0,
+    sort_by: str = "total_points",
+    order: str = "desc",
+    limit: int = 50,
+):
     """
     Return archived player data for a previous FPL season.
     Example season: 2025-26
@@ -273,7 +281,41 @@ def historical_players(season: str, limit: int = 50):
 
     result = []
 
-    for p in rows[:limit]:
+    for p in rows:
+
+        # Search player name
+        if player:
+            search_name = player.lower()
+
+            full_name = (
+                f"{p.get('first_name', '')} "
+                f"{p.get('second_name', '')}"
+            ).lower()
+
+            web_name = p.get("web_name", "").lower()
+
+            if (
+                search_name not in full_name
+                and search_name not in web_name
+            ):
+                continue
+
+        # Filter position
+        if position is not None:
+            try:
+                if int(p.get("element_type", 0)) != position:
+                    continue
+            except ValueError:
+                continue
+
+        # Filter minimum minutes
+        try:
+            minutes = int(float(p.get("minutes", 0) or 0))
+        except ValueError:
+            minutes = 0
+
+        if minutes < min_minutes:
+            continue
         result.append({
             "id": p.get("id"),
             "first_name": p.get("first_name"),
@@ -296,7 +338,39 @@ def historical_players(season: str, limit: int = 50):
             "bonus": p.get("bonus"),
             "bps": p.get("bps"),
         })
+            allowed_sort_fields = {
+        "minutes",
+        "total_points",
+        "goals_scored",
+        "assists",
+        "expected_goals",
+        "expected_assists",
+        "expected_goal_involvements",
+        "expected_goals_conceded",
+        "clean_sheets",
+        "saves",
+        "bonus",
+        "bps",
+    }
 
+    if sort_by not in allowed_sort_fields:
+        sort_by = "total_points"
+
+    def historical_sort_value(p):
+        try:
+            return float(p.get(sort_by, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    reverse = order.lower() != "asc"
+
+    result.sort(
+        key=historical_sort_value,
+        reverse=reverse
+    )
+
+    result = result[:limit]
+    
     return {
         "season": season,
         "count": len(result),
