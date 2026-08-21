@@ -1682,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.2-core-fpl-fixture-cs-saves"
+MODEL_VERSION_V3 = "3.3-core-fpl-prob-appearance"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -1974,6 +1974,51 @@ def fixture_clean_sheet_probability(
     }
 
 
+def probabilistic_appearance(expected_minutes):
+    """
+    V3.3: convert expected minutes into appearance probabilities.
+
+    Expected minutes alone cannot identify the exact distribution of playing
+    time, so this is deliberately a transparent heuristic:
+
+    - P(appearance) rises linearly from 0 to 1 between 0 and 60 expected mins.
+    - Conditional on appearing, P(60+ mins) follows a logistic curve centred
+      on 60 expected mins with an 8-minute scale.
+    - P(60+) is capped by P(appearance).
+
+    Expected FPL appearance points = P(appearance) + P(60+).
+    This removes the hard 60-minute cliff while preserving near-2 appearance
+    points for highly nailed 85-90 minute players.
+    """
+    minutes = max(0.0, min(float(expected_minutes), 90.0))
+
+    if minutes <= 0:
+        return {
+            "appearance_probability": 0.0,
+            "sixty_plus_probability": 0.0,
+            "appearance_xpts": 0.0,
+        }
+
+    appearance_probability = min(1.0, minutes / 60.0)
+
+    conditional_sixty_plus = 1.0 / (
+        1.0 + math.exp(-(minutes - 60.0) / 8.0)
+    )
+
+    sixty_plus_probability = min(
+        appearance_probability,
+        appearance_probability * conditional_sixty_plus,
+    )
+
+    appearance_xpts = appearance_probability + sixty_plus_probability
+
+    return {
+        "appearance_probability": appearance_probability,
+        "sixty_plus_probability": sixty_plus_probability,
+        "appearance_xpts": appearance_xpts,
+    }
+
+
 def calculate_core_projection(
     position_id,
     xg_per90,
@@ -1989,7 +2034,7 @@ def calculate_core_projection(
     save_multiplier=1.0,
 ):
     """
-    V3 expected FPL points for one fixture.
+    V3.3 expected FPL points for one fixture.
 
     Attack is adjusted for opponent defensive weakness.
 
@@ -1999,7 +2044,8 @@ def calculate_core_projection(
     Goalkeeper saves are fixture-adjusted using opponent
     venue-specific attacking strength. Defensive contributions
     and bonus still use historical per-90 rates without fixture
-    adjustment.
+    adjustment. Appearance and clean-sheet eligibility use a probabilistic
+    60-minute model rather than a hard expected-minutes threshold.
     """
 
     expected_minutes = max(
@@ -2025,11 +2071,10 @@ def calculate_core_projection(
         adjusted_xa_per90 * minutes_factor
     )
 
-    appearance_xpts = (
-        appearance_expected_points(
-            expected_minutes
-        )
-    )
+    appearance = probabilistic_appearance(expected_minutes)
+    appearance_probability = appearance["appearance_probability"]
+    sixty_plus_probability = appearance["sixty_plus_probability"]
+    appearance_xpts = appearance["appearance_xpts"]
 
     goal_xpts = (
         expected_goals
@@ -2051,16 +2096,14 @@ def calculate_core_projection(
 
     cs_probability = max(0.0, min(cs_probability, 1.0))
 
-    # CS points require 60+ minutes.
-    if expected_minutes >= 60:
-        clean_sheet_xpts = (
-            cs_probability
-            * clean_sheet_points_for_position(
-                position_id
-            )
-        )
-    else:
-        clean_sheet_xpts = 0.0
+    # V3.3: CS points require 60+ actual minutes, so weight the
+    # fixture clean-sheet probability by P(60+) rather than using a hard
+    # expected-minutes threshold.
+    clean_sheet_xpts = (
+        cs_probability
+        * sixty_plus_probability
+        * clean_sheet_points_for_position(position_id)
+    )
 
     # V1.6: fixture-adjust goalkeeper save volume.
     # Historical saves/90 is the goalkeeper baseline. Opponent
@@ -2120,6 +2163,12 @@ def calculate_core_projection(
 
         "expected_saves":
             round(expected_saves, 3),
+
+        "appearance_probability":
+            round(appearance_probability, 3),
+
+        "sixty_plus_probability":
+            round(sixty_plus_probability, 3),
 
         "appearance_xpts":
             round(appearance_xpts, 3),
