@@ -613,3 +613,406 @@ def player_pool(
         },
         "players": result,
     }
+# ============================================================
+# PROJECTION ENGINE V1
+# ============================================================
+
+MODEL_VERSION = "1.0-unadjusted"
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_historical_lookup(season="2025-26"):
+    """
+    Load archived FPL player data and index by web_name.
+    """
+    history_url = (
+        f"{HISTORICAL_BASE}/{season}/players_raw.csv"
+    )
+
+    response = requests.get(history_url, timeout=30)
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
+            )
+        )
+    )
+
+    lookup = {}
+
+    for row in rows:
+        key = row.get("web_name", "").strip().lower()
+
+        if key:
+            lookup[key] = row
+
+    return lookup
+
+
+def get_player_fixtures(team_id, start_gw=1, horizon=6):
+    """
+    Return fixtures for one team over the requested GW horizon.
+    """
+    response = requests.get(
+        f"{FPL_BASE}/fixtures/",
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    all_fixtures = response.json()
+
+    end_gw = start_gw + horizon - 1
+
+    result = []
+
+    for fixture in all_fixtures:
+        event = fixture.get("event")
+
+        if event is None:
+            continue
+
+        if event < start_gw or event > end_gw:
+            continue
+
+        is_home = fixture.get("team_h") == team_id
+        is_away = fixture.get("team_a") == team_id
+
+        if not is_home and not is_away:
+            continue
+
+        if is_home:
+            opponent_id = fixture.get("team_a")
+            difficulty = fixture.get(
+                "team_h_difficulty"
+            )
+        else:
+            opponent_id = fixture.get("team_h")
+            difficulty = fixture.get(
+                "team_a_difficulty"
+            )
+
+        result.append({
+            "gameweek": event,
+            "fixture_id": fixture.get("id"),
+            "home": is_home,
+            "opponent_id": opponent_id,
+            "difficulty": difficulty,
+        })
+
+    result.sort(
+        key=lambda x: (
+            x["gameweek"],
+            x["fixture_id"] or 0,
+        )
+    )
+
+    return result
+
+
+def appearance_expected_points(expected_minutes):
+    """
+    Simple V1 appearance model.
+
+    This is intentionally transparent rather than pretending
+    expected minutes alone gives us an exact appearance probability.
+
+    >= 60 expected minutes -> 2 appearance points
+    1-59 expected minutes -> scaled between 0 and 1 point
+    0 expected minutes -> 0 points
+    """
+    if expected_minutes <= 0:
+        return 0.0
+
+    if expected_minutes >= 60:
+        return 2.0
+
+    return expected_minutes / 60
+
+
+def goal_points_for_position(position_id):
+    """
+    FPL points awarded per goal by position.
+    """
+    scoring = {
+        1: 6,  # GK
+        2: 6,  # DEF
+        3: 5,  # MID
+        4: 4,  # FWD
+    }
+
+    return scoring.get(position_id, 0)
+
+
+def calculate_unadjusted_projection(
+    position_id,
+    xg_per90,
+    xa_per90,
+    expected_minutes,
+):
+    """
+    Projection Engine V1.
+
+    Includes:
+    - appearance points
+    - expected goal points
+    - expected assist points
+
+    Does NOT yet include:
+    - fixture adjustment
+    - clean-sheet points
+    - goalkeeper saves
+    - defensive contributions
+    - bonus
+    - cards
+    - own goals
+    - penalty misses
+
+    Those will be added in later model versions.
+    """
+    expected_minutes = max(
+        0.0,
+        min(float(expected_minutes), 90.0)
+    )
+
+    minutes_factor = expected_minutes / 90
+
+    expected_goals = xg_per90 * minutes_factor
+    expected_assists = xa_per90 * minutes_factor
+
+    appearance_xpts = appearance_expected_points(
+        expected_minutes
+    )
+
+    goal_xpts = (
+        expected_goals
+        * goal_points_for_position(position_id)
+    )
+
+    assist_xpts = expected_assists * 3
+
+    attacking_xpts = goal_xpts + assist_xpts
+
+    total_xpts = appearance_xpts + attacking_xpts
+
+    return {
+        "expected_minutes":
+            round(expected_minutes, 1),
+        "expected_goals":
+            round(expected_goals, 3),
+        "expected_assists":
+            round(expected_assists, 3),
+        "appearance_xpts":
+            round(appearance_xpts, 3),
+        "goal_xpts":
+            round(goal_xpts, 3),
+        "assist_xpts":
+            round(assist_xpts, 3),
+        "attacking_xpts":
+            round(attacking_xpts, 3),
+        "total_xpts":
+            round(total_xpts, 3),
+    }
+
+
+@app.get("/projection/{player_id}")
+def player_projection(
+    player_id: int,
+    expected_minutes: float = 75,
+    start_gw: int = 1,
+    horizon: int = 6,
+):
+    """
+    Produce a transparent V1 GW projection for one player.
+
+    expected_minutes is currently applied to every fixture in
+    the horizon. The GPT can override it based on current
+    expected-minutes research.
+    """
+    horizon = max(1, min(horizon, 10))
+
+    current = get_bootstrap()
+
+    player = next(
+        (
+            p for p in current["elements"]
+            if p["id"] == player_id
+        ),
+        None,
+    )
+
+    if player is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Current FPL player not found",
+        )
+
+    team_lookup = {
+        t["id"]: t["name"]
+        for t in current["teams"]
+    }
+
+    history_lookup = get_historical_lookup()
+
+    historical = history_lookup.get(
+        player["web_name"].strip().lower()
+    )
+
+    if historical is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No 2025-26 historical match found "
+                "for this player"
+            ),
+        )
+
+    history_minutes = safe_int(
+        historical.get("minutes")
+    )
+
+    if history_minutes <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Historical player has no usable "
+                "minutes for projection"
+            ),
+        )
+
+    history_xg = safe_float(
+        historical.get("expected_goals")
+    )
+
+    history_xa = safe_float(
+        historical.get("expected_assists")
+    )
+
+    xg_per90 = (
+        history_xg / history_minutes * 90
+    )
+
+    xa_per90 = (
+        history_xa / history_minutes * 90
+    )
+
+    fixtures = get_player_fixtures(
+        player["team"],
+        start_gw=start_gw,
+        horizon=horizon,
+    )
+
+    fixture_projections = []
+
+    for fixture in fixtures:
+
+        projection = calculate_unadjusted_projection(
+            position_id=player["element_type"],
+            xg_per90=xg_per90,
+            xa_per90=xa_per90,
+            expected_minutes=expected_minutes,
+        )
+
+        fixture_projections.append({
+            **fixture,
+            **projection,
+        })
+
+    total_xpts = sum(
+        x["total_xpts"]
+        for x in fixture_projections
+    )
+
+    total_expected_goals = sum(
+        x["expected_goals"]
+        for x in fixture_projections
+    )
+
+    total_expected_assists = sum(
+        x["expected_assists"]
+        for x in fixture_projections
+    )
+
+    return {
+        "model_version": MODEL_VERSION,
+        "model_type":
+            "unadjusted attacking projection",
+        "warning": (
+            "V1 is not a complete FPL xPts model. "
+            "It currently includes appearance, goals "
+            "and assists only. Fixture strength, clean "
+            "sheets, saves, defensive contributions "
+            "and bonus are not yet included."
+        ),
+        "player": {
+            "id": player["id"],
+            "name": player["web_name"],
+            "team": team_lookup.get(
+                player["team"]
+            ),
+            "team_id": player["team"],
+            "position_id":
+                player["element_type"],
+            "price":
+                player["now_cost"] / 10,
+            "status": player.get("status"),
+        },
+        "historical_basis": {
+            "season": "2025-26",
+            "minutes": history_minutes,
+            "expected_goals":
+                round(history_xg, 3),
+            "expected_assists":
+                round(history_xa, 3),
+            "xg_per90":
+                round(xg_per90, 3),
+            "xa_per90":
+                round(xa_per90, 3),
+            "xgi_per90":
+                round(
+                    xg_per90 + xa_per90,
+                    3,
+                ),
+        },
+        "assumptions": {
+            "expected_minutes_per_fixture":
+                expected_minutes,
+            "start_gw": start_gw,
+            "horizon": horizon,
+            "fixture_adjustment": False,
+        },
+        "fixtures": fixture_projections,
+        "totals": {
+            "fixtures":
+                len(fixture_projections),
+            "expected_goals":
+                round(
+                    total_expected_goals,
+                    3,
+                ),
+            "expected_assists":
+                round(
+                    total_expected_assists,
+                    3,
+                ),
+            "total_xpts":
+                round(total_xpts, 3),
+        },
+    }
