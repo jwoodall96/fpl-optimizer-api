@@ -1985,7 +1985,7 @@ def calculate_core_projection(
 @app.get("/projection-v3/{player_id}")
 def player_projection_v3(
     player_id: int,
-    expected_minutes: float = 75,
+    expected_minutes: float = 0,
     start_gw: int = 1,
     horizon: int = 6,
 ):
@@ -2045,11 +2045,21 @@ def player_projection_v3(
             detail="No usable historical minutes",
         )
 
-    model_expected_minutes = (
+    baseline_expected_minutes = (
         estimate_expected_minutes(historical)
         if expected_minutes <= 0
         else expected_minutes
     )
+
+    # V1.4.1: use the same live FPL availability adjustment as the
+    # squad optimiser. This prevents injured/suspended/unavailable
+    # players from retaining historical baseline minutes in the
+    # standalone V3 projection.
+    availability = adjust_minutes_for_current_availability(
+        player=player,
+        baseline_minutes=baseline_expected_minutes,
+    )
+    model_expected_minutes = availability["expected_minutes"]
 
     strength_lookup = (
         get_historical_team_strength_lookup()
@@ -2269,8 +2279,16 @@ def player_projection_v3(
         "assumptions": {
             "expected_minutes":
                 model_expected_minutes,
+            "baseline_expected_minutes":
+                baseline_expected_minutes,
             "expected_minutes_mode":
                 "auto" if expected_minutes <= 0 else "manual",
+            "current_availability_adjustment":
+                True,
+            "availability_source":
+                "live FPL status/chance_of_playing_next_round/news",
+            "availability":
+                availability,
             "rate_shrinkage_minutes":
                 900,
             "promoted_team_defence_weakness":
@@ -2706,4 +2724,3 @@ def optimize_squad(
         "weekly_lineups": weekly_lineups,
         "squad": squad,
     }
-
