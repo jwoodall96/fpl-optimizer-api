@@ -1016,3 +1016,26 @@ def player_projection(
                 round(total_xpts, 3),
         },
     }
+@app.get("/test-understat")
+def test_understat():
+    url = "https://understat.com/league/EPL/2025"
+
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; FPL-Optimizer/1.0)"
+            )
+        },
+    )
+
+    return {
+        "status_code": response.status_code,
+        "content_length": len(response.text),
+        "contains_teams_data":
+            "teamsData" in response.text,
+        "contains_dates_data":
+            "datesData" in response.text,
+    }
