@@ -2320,7 +2320,68 @@ def get_historical_lookup_by_code(
 
     return lookup
 
+def adjust_minutes_for_current_availability(
+    player,
+    baseline_minutes,
+):
+    """
+    Adjust baseline expected minutes using current FPL
+    availability information.
 
+    Historical availability remains the baseline.
+    Current injury/suspension information can reduce it.
+    """
+
+    status = player.get("status", "a")
+
+    chance = player.get(
+        "chance_of_playing_next_round"
+    )
+
+    news = player.get("news", "") or ""
+
+    adjusted_minutes = baseline_minutes
+    adjustment_reason = "no current adjustment"
+
+    # Definitely unavailable
+    if status in {"i", "s", "u"}:
+        adjusted_minutes = 0.0
+        adjustment_reason = (
+            f"FPL status '{status}' - unavailable"
+        )
+
+    # Doubtful / flagged player with an explicit
+    # chance-of-playing percentage
+    elif chance is not None:
+        try:
+            probability = float(chance) / 100.0
+
+            adjusted_minutes = (
+                baseline_minutes * probability
+            )
+
+            adjustment_reason = (
+                f"FPL chance of playing: {chance}%"
+            )
+
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "baseline_minutes": round(
+            baseline_minutes,
+            1,
+        ),
+        "expected_minutes": round(
+            adjusted_minutes,
+            1,
+        ),
+        "status": status,
+        "chance_of_playing_next_round": chance,
+        "news": news,
+        "adjustment_reason": adjustment_reason,
+    }
+    
 def project_player_for_optimizer(
     player,
     current,
