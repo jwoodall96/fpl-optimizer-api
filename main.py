@@ -1016,26 +1016,173 @@ def player_projection(
                 round(total_xpts, 3),
         },
     }
-@app.get("/test-understat")
-def test_understat():
-    url = "https://understat.com/league/EPL/2025"
+@app.get("/historical-team-strength")
+def historical_team_strength(
+    season: str = "2025-26",
+):
+    """
+    Calculate historical team attacking and defensive strength
+    from archived FPL fixture results.
 
-    response = requests.get(
-        url,
-        timeout=30,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(compatible; FPL-Optimizer/1.0)"
+    Strength of 1.0 = league average.
+    >1 attacking strength = stronger attack.
+    >1 defensive weakness = easier opponent to score against.
+    """
+
+    url = f"{HISTORICAL_BASE}/{season}/fixtures.csv"
+
+    response = requests.get(url, timeout=30)
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Fixture history not found for {season}",
+        )
+
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
             )
-        },
+        )
     )
 
+    teams = {}
+
+    def ensure_team(team_id):
+        if team_id not in teams:
+            teams[team_id] = {
+                "home_games": 0,
+                "away_games": 0,
+                "home_goals_for": 0,
+                "home_goals_against": 0,
+                "away_goals_for": 0,
+                "away_goals_against": 0,
+            }
+
+    for row in rows:
+        try:
+            home = int(row["team_h"])
+            away = int(row["team_a"])
+            home_goals = int(row["team_h_score"])
+            away_goals = int(row["team_a_score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        ensure_team(home)
+        ensure_team(away)
+
+        teams[home]["home_games"] += 1
+        teams[home]["home_goals_for"] += home_goals
+        teams[home]["home_goals_against"] += away_goals
+
+        teams[away]["away_games"] += 1
+        teams[away]["away_goals_for"] += away_goals
+        teams[away]["away_goals_against"] += home_goals
+
+    total_home_goals = sum(
+        t["home_goals_for"] for t in teams.values()
+    )
+    total_away_goals = sum(
+        t["away_goals_for"] for t in teams.values()
+    )
+
+    total_home_games = sum(
+        t["home_games"] for t in teams.values()
+    )
+    total_away_games = sum(
+        t["away_games"] for t in teams.values()
+    )
+
+    league_home_goals_per_game = (
+        total_home_goals / total_home_games
+        if total_home_games else 0
+    )
+
+    league_away_goals_per_game = (
+        total_away_goals / total_away_games
+        if total_away_games else 0
+    )
+
+    result = []
+
+    for team_id, t in teams.items():
+
+        home_gf_pg = (
+            t["home_goals_for"] / t["home_games"]
+            if t["home_games"] else 0
+        )
+
+        home_ga_pg = (
+            t["home_goals_against"] / t["home_games"]
+            if t["home_games"] else 0
+        )
+
+        away_gf_pg = (
+            t["away_goals_for"] / t["away_games"]
+            if t["away_games"] else 0
+        )
+
+        away_ga_pg = (
+            t["away_goals_against"] / t["away_games"]
+            if t["away_games"] else 0
+        )
+
+        result.append({
+            "historical_team_id": team_id,
+
+            "home_games": t["home_games"],
+            "away_games": t["away_games"],
+
+            "home_goals_for_per_game":
+                round(home_gf_pg, 3),
+
+            "away_goals_for_per_game":
+                round(away_gf_pg, 3),
+
+            "home_goals_against_per_game":
+                round(home_ga_pg, 3),
+
+            "away_goals_against_per_game":
+                round(away_ga_pg, 3),
+
+            "home_attack_strength": round(
+                home_gf_pg /
+                league_home_goals_per_game,
+                3,
+            ) if league_home_goals_per_game else 0,
+
+            "away_attack_strength": round(
+                away_gf_pg /
+                league_away_goals_per_game,
+                3,
+            ) if league_away_goals_per_game else 0,
+
+            "home_defence_weakness": round(
+                home_ga_pg /
+                league_away_goals_per_game,
+                3,
+            ) if league_away_goals_per_game else 0,
+
+            "away_defence_weakness": round(
+                away_ga_pg /
+                league_home_goals_per_game,
+                3,
+            ) if league_home_goals_per_game else 0,
+        })
+
     return {
-        "status_code": response.status_code,
-        "content_length": len(response.text),
-        "contains_teams_data":
-            "teamsData" in response.text,
-        "contains_dates_data":
-            "datesData" in response.text,
+        "season": season,
+        "league": {
+            "home_goals_per_team_game":
+                round(league_home_goals_per_game, 3),
+            "away_goals_per_team_game":
+                round(league_away_goals_per_game, 3),
+        },
+        "teams": result,
     }
