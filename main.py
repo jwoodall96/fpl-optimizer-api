@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+rom fastapi import FastAPI, HTTPException
 import requests
 
 app = FastAPI(
@@ -2220,6 +2220,52 @@ from pulp import (
 )
 
 
+def get_historical_lookup_by_code(
+    season="2025-26",
+):
+    """
+    Historical player lookup using persistent FPL player code.
+
+    This is much safer than matching on web_name because names can
+    collide across seasons or change, while FPL player code is the
+    persistent identifier for the same player.
+    """
+
+    url = (
+        f"{HISTORICAL_BASE}/"
+        f"{season}/players_raw.csv"
+    )
+
+    response = requests.get(
+        url,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    import csv
+    import io
+
+    rows = list(
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
+            )
+        )
+    )
+
+    lookup = {}
+
+    for row in rows:
+        try:
+            code = int(row["code"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        lookup[code] = row
+
+    return lookup
+
+
 def project_player_for_optimizer(
     player,
     current,
@@ -2234,9 +2280,17 @@ def project_player_for_optimizer(
     making an internal HTTP call to our own API.
     """
 
-    historical = history_lookup.get(
-        player["web_name"].strip().lower()
-    )
+    # Match current player to historical data using FPL's persistent
+    # player code rather than web_name. This prevents same-name
+    # collisions from assigning another player's historical rates.
+    player_code = player.get("code")
+
+    try:
+        player_code = int(player_code)
+    except (TypeError, ValueError):
+        return None
+
+    historical = history_lookup.get(player_code)
 
     if historical is None:
         return None
@@ -2362,7 +2416,7 @@ def optimize_squad(
 
     current = get_bootstrap()
 
-    history_lookup = get_historical_lookup()
+    history_lookup = get_historical_lookup_by_code()
 
     strength_lookup = (
         get_historical_team_strength_lookup()
@@ -2511,7 +2565,7 @@ def optimize_squad(
         )
 
     return {
-        "optimizer_version": "1.0",
+        "optimizer_version": "1.1-code-matched",
         "projection_model": MODEL_VERSION_V3,
         "objective":
             "maximise total squad xPts",
@@ -2532,6 +2586,8 @@ def optimize_squad(
             "bench_weighting": False,
             "captaincy": False,
             "player_specific_minutes": False,
+            "historical_player_matching":
+                "persistent FPL player code",
         },
         "candidate_count": len(candidates),
         "total_cost": round(total_cost, 1),
