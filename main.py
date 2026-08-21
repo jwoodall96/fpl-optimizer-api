@@ -1682,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.1-core-fpl-fixture-cs"
+MODEL_VERSION_V3 = "3.2-core-fpl-fixture-cs-saves"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -1986,6 +1986,7 @@ def calculate_core_projection(
     attack_multiplier=1.0,
     clean_sheet_multiplier=1.0,
     fixture_clean_sheet_probability=None,
+    save_multiplier=1.0,
 ):
     """
     V3 expected FPL points for one fixture.
@@ -1995,8 +1996,10 @@ def calculate_core_projection(
     Clean-sheet rate is adjusted for opponent attacking
     strength.
 
-    Saves, defensive contributions and bonus currently use
-    historical per-90 rates without fixture adjustment.
+    Goalkeeper saves are fixture-adjusted using opponent
+    venue-specific attacking strength. Defensive contributions
+    and bonus still use historical per-90 rates without fixture
+    adjustment.
     """
 
     expected_minutes = max(
@@ -2059,11 +2062,20 @@ def calculate_core_projection(
     else:
         clean_sheet_xpts = 0.0
 
-    # 1 point per 3 goalkeeper saves.
+    # V1.6: fixture-adjust goalkeeper save volume.
+    # Historical saves/90 is the goalkeeper baseline. Opponent
+    # venue-specific attack strength is a proxy for shot pressure.
     if position_id == 1:
-        expected_saves = (
-            saves_per90 * minutes_factor
+        bounded_save_multiplier = max(
+            0.65,
+            min(float(save_multiplier), 1.50),
         )
+        expected_saves = (
+            saves_per90
+            * minutes_factor
+            * bounded_save_multiplier
+        )
+        # Expected-value approximation of 1 FPL point per 3 saves.
         save_xpts = expected_saves / 3
     else:
         expected_saves = 0.0
@@ -2300,6 +2312,8 @@ def player_projection_v3(
 
             promoted_assumption = True
 
+        save_multiplier = cs_info["opponent_attack_strength"]
+
         projection = calculate_core_projection(
             position_id=
                 player["element_type"],
@@ -2331,6 +2345,7 @@ def player_projection_v3(
             clean_sheet_multiplier=
                 cs_multiplier,
             fixture_clean_sheet_probability=cs_info["clean_sheet_probability"],
+            save_multiplier=save_multiplier,
         )
 
         projections.append({
@@ -2350,6 +2365,24 @@ def player_projection_v3(
 
             "promoted_assumption":
                 promoted_assumption,
+
+            "expected_goals_conceded":
+                round(cs_info["expected_goals_conceded"], 3),
+            "clean_sheet_basis":
+                cs_info["clean_sheet_basis"],
+            "opponent_attack_strength":
+                round(cs_info["opponent_attack_strength"], 3),
+            "team_defence_weakness":
+                round(cs_info["team_defence_weakness"], 3),
+            "clean_sheet_promoted_assumption":
+                (
+                    cs_info["opponent_promoted_assumption"]
+                    or cs_info["team_promoted_assumption"]
+                ),
+            "save_multiplier":
+                round(max(0.65, min(float(save_multiplier), 1.50)), 3),
+            "save_basis":
+                "opponent venue-specific attack strength",
 
             **projection,
         })
@@ -2459,9 +2492,9 @@ def player_projection_v3(
             "promoted_team_defence_weakness":
                 PROMOTED_DEFENCE_WEAKNESS,
             "clean_sheet_fixture_adjustment":
-                False,
+                True,
             "save_fixture_adjustment":
-                False,
+                True,
             "bonus_fixture_adjustment":
                 False,
             "defcon_fixture_adjustment":
@@ -2549,6 +2582,7 @@ def project_player_for_optimizer(
     history_lookup,
     strength_lookup,
     positional_baselines,
+    full_strength_lookup,
     expected_minutes=0,
     start_gw=1,
     horizon=6,
@@ -2618,6 +2652,13 @@ def project_player_for_optimizer(
             fixture["opponent_id"]
         )
 
+        cs_info = fixture_clean_sheet_probability(
+            player_team_name=current_teams.get(player["team"]),
+            opponent_name=opponent_name,
+            player_is_home=fixture["home"],
+            full_strength_lookup=full_strength_lookup,
+        )
+
         opponent_strength = (
             strength_lookup.get(
                 opponent_name.strip().lower()
@@ -2659,6 +2700,10 @@ def project_player_for_optimizer(
             expected_minutes=model_expected_minutes,
             attack_multiplier=attack_multiplier,
             clean_sheet_multiplier=1.0,
+            fixture_clean_sheet_probability=
+                cs_info["clean_sheet_probability"],
+            save_multiplier=
+                cs_info["opponent_attack_strength"],
         )
 
         gw_projections.append({
@@ -2672,6 +2717,16 @@ def project_player_for_optimizer(
                 cs_info["opponent_promoted_assumption"]
                 or cs_info["team_promoted_assumption"]
             ),
+            "save_multiplier": round(
+                max(0.65, min(float(cs_info["opponent_attack_strength"]), 1.50)),
+                3,
+            ),
+            "save_basis":
+                "opponent venue-specific attack strength",
+            "expected_saves":
+                projection["expected_saves"],
+            "save_xpts":
+                projection["save_xpts"],
             "home": fixture["home"],
             "xpts": projection["total_xpts"],
         })
@@ -2717,6 +2772,7 @@ def optimize_squad(
     current = get_bootstrap()
     history_lookup = get_historical_lookup_by_code()
     strength_lookup = get_historical_team_strength_lookup()
+    full_strength_lookup = get_historical_team_full_strength_lookup()
     positional_baselines = get_positional_rate_baselines(history_lookup)
 
     candidates = []
@@ -2734,6 +2790,7 @@ def optimize_squad(
             history_lookup=history_lookup,
             strength_lookup=strength_lookup,
             positional_baselines=positional_baselines,
+            full_strength_lookup=full_strength_lookup,
             expected_minutes=expected_minutes,
             start_gw=start_gw,
             horizon=horizon,
