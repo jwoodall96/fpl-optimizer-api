@@ -1676,3 +1676,525 @@ def historical_fields(
         ),
         "fields": reader.fieldnames or [],
     }
+
+# ============================================================
+# PROJECTION ENGINE V3 - CORE FPL XPTS
+# ============================================================
+
+MODEL_VERSION_V3 = "3.0-core-fpl"
+
+
+def clean_sheet_points_for_position(position_id):
+    scoring = {
+        1: 4,  # GK
+        2: 4,  # DEF
+        3: 1,  # MID
+        4: 0,  # FWD
+    }
+    return scoring.get(position_id, 0)
+
+
+def get_historical_player_rates(historical):
+    """
+    Convert historical FPL totals into per-90 rates.
+    """
+    minutes = safe_int(historical.get("minutes"))
+
+    if minutes <= 0:
+        return None
+
+    factor = 90 / minutes
+
+    return {
+        "minutes": minutes,
+        "xg_per90":
+            safe_float(
+                historical.get("expected_goals")
+            ) * factor,
+        "xa_per90":
+            safe_float(
+                historical.get("expected_assists")
+            ) * factor,
+        "clean_sheets_per90":
+            safe_float(
+                historical.get("clean_sheets")
+            ) * factor,
+        "saves_per90":
+            safe_float(
+                historical.get("saves")
+            ) * factor,
+        "bonus_per90":
+            safe_float(
+                historical.get("bonus")
+            ) * factor,
+        "defcon_points_per90":
+            safe_float(
+                historical.get(
+                    "defensive_contribution"
+                )
+            ) * factor,
+    }
+
+
+def calculate_core_projection(
+    position_id,
+    xg_per90,
+    xa_per90,
+    clean_sheets_per90,
+    saves_per90,
+    bonus_per90,
+    defcon_points_per90,
+    expected_minutes,
+    attack_multiplier=1.0,
+    clean_sheet_multiplier=1.0,
+):
+    """
+    V3 expected FPL points for one fixture.
+
+    Attack is adjusted for opponent defensive weakness.
+
+    Clean-sheet rate is adjusted for opponent attacking
+    strength.
+
+    Saves, defensive contributions and bonus currently use
+    historical per-90 rates without fixture adjustment.
+    """
+
+    expected_minutes = max(
+        0.0,
+        min(float(expected_minutes), 90.0)
+    )
+
+    minutes_factor = expected_minutes / 90
+
+    adjusted_xg_per90 = (
+        xg_per90 * attack_multiplier
+    )
+
+    adjusted_xa_per90 = (
+        xa_per90 * attack_multiplier
+    )
+
+    expected_goals = (
+        adjusted_xg_per90 * minutes_factor
+    )
+
+    expected_assists = (
+        adjusted_xa_per90 * minutes_factor
+    )
+
+    appearance_xpts = (
+        appearance_expected_points(
+            expected_minutes
+        )
+    )
+
+    goal_xpts = (
+        expected_goals
+        * goal_points_for_position(
+            position_id
+        )
+    )
+
+    assist_xpts = (
+        expected_assists * 3
+    )
+
+    # Historical clean_sheets_per90 is being used
+    # as an approximate clean-sheet probability.
+    cs_probability = (
+        clean_sheets_per90
+        * clean_sheet_multiplier
+    )
+
+    cs_probability = max(
+        0.0,
+        min(cs_probability, 1.0)
+    )
+
+    # CS points require 60+ minutes.
+    if expected_minutes >= 60:
+        clean_sheet_xpts = (
+            cs_probability
+            * clean_sheet_points_for_position(
+                position_id
+            )
+        )
+    else:
+        clean_sheet_xpts = 0.0
+
+    # 1 point per 3 goalkeeper saves.
+    if position_id == 1:
+        expected_saves = (
+            saves_per90 * minutes_factor
+        )
+        save_xpts = expected_saves / 3
+    else:
+        expected_saves = 0.0
+        save_xpts = 0.0
+
+    defcon_xpts = (
+        defcon_points_per90
+        * minutes_factor
+    )
+
+    bonus_xpts = (
+        bonus_per90
+        * minutes_factor
+    )
+
+    total_xpts = (
+        appearance_xpts
+        + goal_xpts
+        + assist_xpts
+        + clean_sheet_xpts
+        + save_xpts
+        + defcon_xpts
+        + bonus_xpts
+    )
+
+    return {
+        "expected_minutes":
+            round(expected_minutes, 1),
+
+        "expected_goals":
+            round(expected_goals, 3),
+
+        "expected_assists":
+            round(expected_assists, 3),
+
+        "clean_sheet_probability":
+            round(cs_probability, 3),
+
+        "expected_saves":
+            round(expected_saves, 3),
+
+        "appearance_xpts":
+            round(appearance_xpts, 3),
+
+        "goal_xpts":
+            round(goal_xpts, 3),
+
+        "assist_xpts":
+            round(assist_xpts, 3),
+
+        "clean_sheet_xpts":
+            round(clean_sheet_xpts, 3),
+
+        "save_xpts":
+            round(save_xpts, 3),
+
+        "defcon_xpts":
+            round(defcon_xpts, 3),
+
+        "bonus_xpts":
+            round(bonus_xpts, 3),
+
+        "total_xpts":
+            round(total_xpts, 3),
+    }
+
+
+@app.get("/projection-v3/{player_id}")
+def player_projection_v3(
+    player_id: int,
+    expected_minutes: float = 75,
+    start_gw: int = 1,
+    horizon: int = 6,
+):
+    """
+    Core FPL expected-points projection.
+
+    Includes:
+    appearance, goals, assists, clean sheets,
+    goalkeeper saves, defensive contributions and bonus.
+    """
+
+    horizon = max(1, min(horizon, 10))
+
+    current = get_bootstrap()
+
+    player = next(
+        (
+            p for p in current["elements"]
+            if p["id"] == player_id
+        ),
+        None,
+    )
+
+    if player is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Current FPL player not found",
+        )
+
+    current_teams = {
+        t["id"]: t["name"]
+        for t in current["teams"]
+    }
+
+    history_lookup = get_historical_lookup()
+
+    historical = history_lookup.get(
+        player["web_name"].strip().lower()
+    )
+
+    if historical is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No historical player match found",
+        )
+
+    rates = get_historical_player_rates(
+        historical
+    )
+
+    if rates is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No usable historical minutes",
+        )
+
+    strength_lookup = (
+        get_historical_team_strength_lookup()
+    )
+
+    fixtures = get_player_fixtures(
+        player["team"],
+        start_gw=start_gw,
+        horizon=horizon,
+    )
+
+    projections = []
+
+    for fixture in fixtures:
+
+        opponent_name = current_teams.get(
+            fixture["opponent_id"]
+        )
+
+        opponent_strength = (
+            strength_lookup.get(
+                opponent_name.strip().lower()
+            )
+            if opponent_name
+            else None
+        )
+
+        if opponent_strength:
+
+            if fixture["home"]:
+                attack_multiplier = (
+                    opponent_strength[
+                        "away_defence_weakness"
+                    ]
+                )
+
+                # Approximate opponent attack from inverse
+                # of their away defensive field is NOT valid,
+                # so use FDR-derived neutral adjustment for CS
+                # until team attack lookup is added.
+                cs_multiplier = 1.0
+
+                basis = (
+                    "historical opponent "
+                    "away defence"
+                )
+
+            else:
+                attack_multiplier = (
+                    opponent_strength[
+                        "home_defence_weakness"
+                    ]
+                )
+
+                cs_multiplier = 1.0
+
+                basis = (
+                    "historical opponent "
+                    "home defence"
+                )
+
+            promoted_assumption = False
+
+        else:
+            attack_multiplier = (
+                PROMOTED_DEFENCE_WEAKNESS
+            )
+
+            cs_multiplier = 1.0
+
+            basis = (
+                "promoted-team default assumption"
+            )
+
+            promoted_assumption = True
+
+        projection = calculate_core_projection(
+            position_id=
+                player["element_type"],
+
+            xg_per90=
+                rates["xg_per90"],
+
+            xa_per90=
+                rates["xa_per90"],
+
+            clean_sheets_per90=
+                rates["clean_sheets_per90"],
+
+            saves_per90=
+                rates["saves_per90"],
+
+            bonus_per90=
+                rates["bonus_per90"],
+
+            defcon_points_per90=
+                rates["defcon_points_per90"],
+
+            expected_minutes=
+                expected_minutes,
+
+            attack_multiplier=
+                attack_multiplier,
+
+            clean_sheet_multiplier=
+                cs_multiplier,
+        )
+
+        projections.append({
+            **fixture,
+
+            "opponent":
+                opponent_name,
+
+            "attack_multiplier":
+                round(
+                    attack_multiplier,
+                    3
+                ),
+
+            "fixture_basis":
+                basis,
+
+            "promoted_assumption":
+                promoted_assumption,
+
+            **projection,
+        })
+
+    total_xpts = sum(
+        p["total_xpts"]
+        for p in projections
+    )
+
+    component_totals = {
+        "appearance_xpts": round(
+            sum(
+                p["appearance_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "goal_xpts": round(
+            sum(
+                p["goal_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "assist_xpts": round(
+            sum(
+                p["assist_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "clean_sheet_xpts": round(
+            sum(
+                p["clean_sheet_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "save_xpts": round(
+            sum(
+                p["save_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "defcon_xpts": round(
+            sum(
+                p["defcon_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+        "bonus_xpts": round(
+            sum(
+                p["bonus_xpts"]
+                for p in projections
+            ),
+            3,
+        ),
+    }
+
+    return {
+        "model_version":
+            MODEL_VERSION_V3,
+
+        "model_type":
+            "core FPL expected points",
+
+        "player": {
+            "id": player["id"],
+            "name": player["web_name"],
+            "team":
+                current_teams.get(
+                    player["team"]
+                ),
+            "position_id":
+                player["element_type"],
+            "price":
+                player["now_cost"] / 10,
+            "status":
+                player.get("status"),
+        },
+
+        "historical_rates_per90": {
+            key: round(value, 3)
+            if isinstance(value, float)
+            else value
+            for key, value
+            in rates.items()
+        },
+
+        "assumptions": {
+            "expected_minutes":
+                expected_minutes,
+            "promoted_team_defence_weakness":
+                PROMOTED_DEFENCE_WEAKNESS,
+            "clean_sheet_fixture_adjustment":
+                False,
+            "save_fixture_adjustment":
+                False,
+            "bonus_fixture_adjustment":
+                False,
+            "defcon_fixture_adjustment":
+                False,
+        },
+
+        "fixtures":
+            projections,
+
+        "component_totals":
+            component_totals,
+
+        "totals": {
+            "fixtures":
+                len(projections),
+            "total_xpts":
+                round(total_xpts, 3),
+        },
+    }
