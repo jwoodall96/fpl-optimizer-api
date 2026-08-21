@@ -2565,7 +2565,7 @@ def player_projection_v3(
     }
 
 # ============================================================
-# SQUAD OPTIMISER V1
+# SQUAD OPTIMISER V1.5 - BENCH-WEIGHTED
 # ============================================================
 
 from pulp import (
@@ -2584,21 +2584,9 @@ def get_historical_lookup_by_code(
 ):
     """
     Historical player lookup using persistent FPL player code.
-
-    This is much safer than matching on web_name because names can
-    collide across seasons or change, while FPL player code is the
-    persistent identifier for the same player.
     """
-
-    url = (
-        f"{HISTORICAL_BASE}/"
-        f"{season}/players_raw.csv"
-    )
-
-    response = requests.get(
-        url,
-        timeout=30,
-    )
+    url = f"{HISTORICAL_BASE}/{season}/players_raw.csv"
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
 
     import csv
@@ -2606,20 +2594,16 @@ def get_historical_lookup_by_code(
 
     rows = list(
         csv.DictReader(
-            io.StringIO(
-                response.content.decode("utf-8")
-            )
+            io.StringIO(response.content.decode("utf-8"))
         )
     )
 
     lookup = {}
-
     for row in rows:
         try:
             code = int(row["code"])
         except (KeyError, TypeError, ValueError):
             continue
-
         lookup[code] = row
 
     return lookup
@@ -2640,19 +2624,13 @@ def project_player_for_optimizer(
     Produce V3-style total xPts for one player without
     making an internal HTTP call to our own API.
     """
-
-    # Match current player to historical data using FPL's persistent
-    # player code rather than web_name. This prevents same-name
-    # collisions from assigning another player's historical rates.
     player_code = player.get("code")
-
     try:
         player_code = int(player_code)
     except (TypeError, ValueError):
         return None
 
     historical = history_lookup.get(player_code)
-
     if historical is None:
         return None
 
@@ -2663,7 +2641,6 @@ def project_player_for_optimizer(
         historical,
         position_baseline=position_baseline,
     )
-
     if rates is None:
         return None
 
@@ -2689,14 +2666,12 @@ def project_player_for_optimizer(
         start_gw=start_gw,
         horizon=horizon,
     )
-
     if not fixtures:
         return None
 
     gw_projections = []
 
     for fixture in fixtures:
-
         opponent_name = current_teams.get(
             fixture["opponent_id"]
         )
@@ -2709,43 +2684,31 @@ def project_player_for_optimizer(
         )
 
         opponent_strength = (
-            strength_lookup.get(
-                opponent_name.strip().lower()
-            )
+            strength_lookup.get(opponent_name.strip().lower())
             if opponent_name
             else None
         )
 
         if opponent_strength:
-
             if fixture["home"]:
-                attack_multiplier = (
-                    opponent_strength[
-                        "away_defence_weakness"
-                    ]
-                )
+                attack_multiplier = opponent_strength[
+                    "away_defence_weakness"
+                ]
             else:
-                attack_multiplier = (
-                    opponent_strength[
-                        "home_defence_weakness"
-                    ]
-                )
-
+                attack_multiplier = opponent_strength[
+                    "home_defence_weakness"
+                ]
         else:
-            attack_multiplier = (
-                PROMOTED_DEFENCE_WEAKNESS
-            )
+            attack_multiplier = PROMOTED_DEFENCE_WEAKNESS
 
         projection = calculate_core_projection(
             position_id=player["element_type"],
             xg_per90=rates["xg_per90"],
             xa_per90=rates["xa_per90"],
-            clean_sheets_per90=
-                rates["clean_sheets_per90"],
+            clean_sheets_per90=rates["clean_sheets_per90"],
             saves_per90=rates["saves_per90"],
             bonus_per90=rates["bonus_per90"],
-            defcon_points_per90=
-                rates["defcon_points_per90"],
+            defcon_points_per90=rates["defcon_points_per90"],
             expected_minutes=model_expected_minutes,
             attack_multiplier=attack_multiplier,
             clean_sheet_multiplier=1.0,
@@ -2758,46 +2721,55 @@ def project_player_for_optimizer(
         gw_projections.append({
             "gameweek": fixture["gameweek"],
             "opponent": opponent_name,
-            "expected_goals_conceded": round(cs_info["expected_goals_conceded"], 3),
+            "expected_goals_conceded": round(
+                cs_info["expected_goals_conceded"], 3
+            ),
             "clean_sheet_basis": cs_info["clean_sheet_basis"],
-            "opponent_attack_strength": round(cs_info["opponent_attack_strength"], 3),
-            "team_defence_weakness": round(cs_info["team_defence_weakness"], 3),
+            "opponent_attack_strength": round(
+                cs_info["opponent_attack_strength"], 3
+            ),
+            "team_defence_weakness": round(
+                cs_info["team_defence_weakness"], 3
+            ),
             "clean_sheet_promoted_assumption": (
                 cs_info["opponent_promoted_assumption"]
                 or cs_info["team_promoted_assumption"]
             ),
             "save_multiplier": round(
-                max(0.65, min(float(cs_info["opponent_attack_strength"]), 1.50)),
+                max(
+                    0.65,
+                    min(
+                        float(cs_info["opponent_attack_strength"]),
+                        1.50,
+                    ),
+                ),
                 3,
             ),
             "save_basis":
                 "opponent venue-specific attack strength",
-            "expected_saves":
-                projection["expected_saves"],
-            "save_xpts":
-                projection["save_xpts"],
+            "expected_saves": projection["expected_saves"],
+            "save_xpts": projection["save_xpts"],
             "home": fixture["home"],
             "xpts": projection["total_xpts"],
         })
 
     total_xpts = sum(
-        gw["xpts"]
-        for gw in gw_projections
+        gw["xpts"] for gw in gw_projections
     )
 
     return {
         "id": player["id"],
         "name": player["web_name"],
         "team_id": player["team"],
-        "team": current_teams.get(
-            player["team"]
-        ),
+        "team": current_teams.get(player["team"]),
         "position_id": player["element_type"],
         "price": player["now_cost"] / 10,
         "expected_minutes": model_expected_minutes,
         "availability": availability,
         "historical_minutes": rates["minutes"],
-        "rate_reliability": round(rates["reliability_weight"], 3),
+        "rate_reliability": round(
+            rates["reliability_weight"], 3
+        ),
         "total_xpts": round(total_xpts, 3),
         "gw_projections": gw_projections,
     }
@@ -2811,28 +2783,45 @@ def optimize_squad(
     horizon: int = 6,
 ):
     """
-    Optimise a legal 15-player FPL squad plus the best starting XI
-    in every gameweek of the horizon. The GW1 captain is optimised
-    explicitly; vice-captain and bench order are then reported from
-    the selected GW1 squad.
+    V1.5 bench-weighted squad optimiser.
+
+    Optimises:
+    - legal 15-player FPL squad
+    - legal starting XI independently in every GW
+    - ordered outfield bench independently in every GW
+    - reserve goalkeeper independently in every GW
+    - GW1 captaincy
+
+    Objective weights:
+    XI = 1.00
+    bench 1 = 0.30
+    bench 2 = 0.10
+    bench 3 = 0.03
+    reserve GK = 0.03
     """
 
     horizon = max(1, min(horizon, 10))
     current = get_bootstrap()
     history_lookup = get_historical_lookup_by_code()
     strength_lookup = get_historical_team_strength_lookup()
-    full_strength_lookup = get_historical_team_full_strength_lookup()
-    positional_baselines = get_positional_rate_baselines(history_lookup)
+    full_strength_lookup = (
+        get_historical_team_full_strength_lookup()
+    )
+    positional_baselines = (
+        get_positional_rate_baselines(history_lookup)
+    )
 
     candidates = []
+
     for player in current["elements"]:
-        # V1.4 allows doubtful/flagged players into the candidate pool so
-        # their live chance-of-playing can reduce expected minutes. Clearly
+        # Doubtful/flagged players may remain in the pool because their
+        # live chance-of-playing reduces expected minutes. Clearly
         # unavailable players remain excluded.
         if player.get("status") in {"i", "s", "u", "n"}:
             continue
         if player.get("can_select") is False:
             continue
+
         projection = project_player_for_optimizer(
             player=player,
             current=current,
@@ -2844,161 +2833,649 @@ def optimize_squad(
             start_gw=start_gw,
             horizon=horizon,
         )
+
         if projection is not None:
             candidates.append(projection)
 
     if not candidates:
-        raise HTTPException(status_code=500, detail="No projection candidates available")
+        raise HTTPException(
+            status_code=500,
+            detail="No projection candidates available",
+        )
 
     gameweeks = sorted({
         gw["gameweek"]
         for p in candidates
         for gw in p["gw_projections"]
     })
+
     gw_xpts = {
         (p["id"], gw["gameweek"]): gw["xpts"]
         for p in candidates
         for gw in p["gw_projections"]
     }
 
-    problem = LpProblem("FPL_XI_Optimizer", LpMaximize)
+    problem = LpProblem(
+        "FPL_Bench_Weighted_Optimizer",
+        LpMaximize,
+    )
 
-    selected = {p["id"]: LpVariable(f"squad_{p['id']}", cat=LpBinary) for p in candidates}
-    starting = {
-        (p["id"], gw): LpVariable(f"start_{p['id']}_{gw}", cat=LpBinary)
-        for p in candidates for gw in gameweeks
+    selected = {
+        p["id"]: LpVariable(
+            f"squad_{p['id']}",
+            cat=LpBinary,
+        )
+        for p in candidates
     }
-    captain = {p["id"]: LpVariable(f"captain_{p['id']}", cat=LpBinary) for p in candidates}
 
-    # Objective: points actually expected from the XI each week,
+    starting = {
+        (p["id"], gw): LpVariable(
+            f"start_{p['id']}_{gw}",
+            cat=LpBinary,
+        )
+        for p in candidates
+        for gw in gameweeks
+    }
+
+    bench1 = {
+        (p["id"], gw): LpVariable(
+            f"bench1_{p['id']}_{gw}",
+            cat=LpBinary,
+        )
+        for p in candidates
+        for gw in gameweeks
+    }
+
+    bench2 = {
+        (p["id"], gw): LpVariable(
+            f"bench2_{p['id']}_{gw}",
+            cat=LpBinary,
+        )
+        for p in candidates
+        for gw in gameweeks
+    }
+
+    bench3 = {
+        (p["id"], gw): LpVariable(
+            f"bench3_{p['id']}_{gw}",
+            cat=LpBinary,
+        )
+        for p in candidates
+        for gw in gameweeks
+    }
+
+    reserve_gk = {
+        (p["id"], gw): LpVariable(
+            f"reserve_gk_{p['id']}_{gw}",
+            cat=LpBinary,
+        )
+        for p in candidates
+        for gw in gameweeks
+    }
+
+    captain = {
+        p["id"]: LpVariable(
+            f"captain_{p['id']}",
+            cat=LpBinary,
+        )
+        for p in candidates
+    }
+
+    XI_WEIGHT = 1.00
+    BENCH1_WEIGHT = 0.30
+    BENCH2_WEIGHT = 0.10
+    BENCH3_WEIGHT = 0.03
+    RESERVE_GK_WEIGHT = 0.03
+
+    # Weighted expected points from every weekly squad role,
     # plus one extra copy of the GW1 captain's points.
     problem += (
-        lpSum(starting[(p["id"], gw)] * gw_xpts.get((p["id"], gw), 0.0)
-              for p in candidates for gw in gameweeks)
-        + lpSum(captain[p["id"]] * gw_xpts.get((p["id"], start_gw), 0.0)
-                for p in candidates)
+        lpSum(
+            XI_WEIGHT
+            * starting[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
+            for p in candidates
+            for gw in gameweeks
+        )
+        + lpSum(
+            BENCH1_WEIGHT
+            * bench1[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
+            for p in candidates
+            for gw in gameweeks
+        )
+        + lpSum(
+            BENCH2_WEIGHT
+            * bench2[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
+            for p in candidates
+            for gw in gameweeks
+        )
+        + lpSum(
+            BENCH3_WEIGHT
+            * bench3[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
+            for p in candidates
+            for gw in gameweeks
+        )
+        + lpSum(
+            RESERVE_GK_WEIGHT
+            * reserve_gk[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
+            for p in candidates
+            for gw in gameweeks
+        )
+        + lpSum(
+            captain[p["id"]]
+            * gw_xpts.get((p["id"], start_gw), 0.0)
+            for p in candidates
+        )
     )
 
     # Legal 15-player squad.
-    problem += lpSum(selected[p["id"]] for p in candidates) == 15
-    problem += lpSum(selected[p["id"]] * p["price"] for p in candidates) <= budget
+    problem += (
+        lpSum(
+            selected[p["id"]]
+            for p in candidates
+        )
+        == 15
+    )
 
-    position_requirements = {1: 2, 2: 5, 3: 5, 4: 3}
+    problem += (
+        lpSum(
+            selected[p["id"]] * p["price"]
+            for p in candidates
+        )
+        <= budget
+    )
+
+    position_requirements = {
+        1: 2,
+        2: 5,
+        3: 5,
+        4: 3,
+    }
+
     for position_id, required in position_requirements.items():
-        problem += lpSum(selected[p["id"]] for p in candidates if p["position_id"] == position_id) == required
+        problem += (
+            lpSum(
+                selected[p["id"]]
+                for p in candidates
+                if p["position_id"] == position_id
+            )
+            == required
+        )
 
-    for team_id in {p["team_id"] for p in candidates}:
-        problem += lpSum(selected[p["id"]] for p in candidates if p["team_id"] == team_id) <= 3
+    for team_id in {
+        p["team_id"] for p in candidates
+    }:
+        problem += (
+            lpSum(
+                selected[p["id"]]
+                for p in candidates
+                if p["team_id"] == team_id
+            )
+            <= 3
+        )
 
-    # Legal starting XI for every GW: 1 GK, 3-5 DEF, 2-5 MID, 1-3 FWD.
+    # Every selected player has exactly one weekly role:
+    # XI, bench 1, bench 2, bench 3, or reserve GK.
     for gw in gameweeks:
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates) == 11
+
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+            )
+            == 11
+        )
+
+        problem += (
+            lpSum(
+                bench1[(p["id"], gw)]
+                for p in candidates
+            )
+            == 1
+        )
+
+        problem += (
+            lpSum(
+                bench2[(p["id"], gw)]
+                for p in candidates
+            )
+            == 1
+        )
+
+        problem += (
+            lpSum(
+                bench3[(p["id"], gw)]
+                for p in candidates
+            )
+            == 1
+        )
+
+        problem += (
+            lpSum(
+                reserve_gk[(p["id"], gw)]
+                for p in candidates
+            )
+            == 1
+        )
+
         for p in candidates:
-            problem += starting[(p["id"], gw)] <= selected[p["id"]]
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 1) == 1
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 2) >= 3
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 2) <= 5
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 3) >= 2
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 3) <= 5
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 4) >= 1
-        problem += lpSum(starting[(p["id"], gw)] for p in candidates if p["position_id"] == 4) <= 3
+            pid = p["id"]
+
+            problem += (
+                starting[(pid, gw)]
+                + bench1[(pid, gw)]
+                + bench2[(pid, gw)]
+                + bench3[(pid, gw)]
+                + reserve_gk[(pid, gw)]
+                == selected[pid]
+            )
+
+            # Only outfield players can occupy the three ordered
+            # outfield bench positions.
+            if p["position_id"] == 1:
+                problem += bench1[(pid, gw)] == 0
+                problem += bench2[(pid, gw)] == 0
+                problem += bench3[(pid, gw)] == 0
+
+            # Only a goalkeeper can be the reserve GK.
+            else:
+                problem += reserve_gk[(pid, gw)] == 0
+
+        # Legal starting XI:
+        # exactly 1 GK, 3-5 DEF, 2-5 MID, 1-3 FWD.
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 1
+            )
+            == 1
+        )
+
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 2
+            )
+            >= 3
+        )
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 2
+            )
+            <= 5
+        )
+
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 3
+            )
+            >= 2
+        )
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 3
+            )
+            <= 5
+        )
+
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 4
+            )
+            >= 1
+        )
+        problem += (
+            lpSum(
+                starting[(p["id"], gw)]
+                for p in candidates
+                if p["position_id"] == 4
+            )
+            <= 3
+        )
 
     # Exactly one GW1 captain, and the captain must start.
-    problem += lpSum(captain[p["id"]] for p in candidates) == 1
+    problem += (
+        lpSum(
+            captain[p["id"]]
+            for p in candidates
+        )
+        == 1
+    )
+
     for p in candidates:
-        problem += captain[p["id"]] <= starting[(p["id"], start_gw)]
+        problem += (
+            captain[p["id"]]
+            <= starting[(p["id"], start_gw)]
+        )
 
     problem.solve(PULP_CBC_CMD(msg=False))
+
     status = LpStatus[problem.status]
     if status != "Optimal":
-        raise HTTPException(status_code=500, detail=f"Optimizer did not find an optimal squad: {status}")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Optimizer did not find an optimal squad: "
+                f"{status}"
+            ),
+        )
 
-    squad = [p for p in candidates if selected[p["id"]].value() == 1]
-    position_names = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    squad = [
+        p for p in candidates
+        if selected[p["id"]].value() == 1
+    ]
+
+    position_names = {
+        1: "GK",
+        2: "DEF",
+        3: "MID",
+        4: "FWD",
+    }
+
     for p in squad:
-        p["position"] = position_names.get(p["position_id"])
+        p["position"] = position_names.get(
+            p["position_id"]
+        )
 
-    total_cost = sum(p["price"] for p in squad)
-    captain_player = next(p for p in squad if captain[p["id"]].value() == 1)
+    total_cost = sum(
+        p["price"] for p in squad
+    )
+
+    captain_player = next(
+        p for p in squad
+        if captain[p["id"]].value() == 1
+    )
 
     weekly_lineups = []
+
+    xi_total = 0.0
+    weighted_bench_total = 0.0
+
     for gw in gameweeks:
-        xi = [p for p in squad if starting[(p["id"], gw)].value() == 1]
-        xi.sort(key=lambda p: (p["position_id"], -gw_xpts.get((p["id"], gw), 0.0)))
+
+        xi = [
+            p for p in squad
+            if starting[(p["id"], gw)].value() == 1
+        ]
+
+        xi.sort(
+            key=lambda p: (
+                p["position_id"],
+                -gw_xpts.get((p["id"], gw), 0.0),
+            )
+        )
+
+        b1 = next(
+            p for p in squad
+            if bench1[(p["id"], gw)].value() == 1
+        )
+        b2 = next(
+            p for p in squad
+            if bench2[(p["id"], gw)].value() == 1
+        )
+        b3 = next(
+            p for p in squad
+            if bench3[(p["id"], gw)].value() == 1
+        )
+        rgk = next(
+            p for p in squad
+            if reserve_gk[(p["id"], gw)].value() == 1
+        )
+
+        xi_xpts = sum(
+            gw_xpts.get((p["id"], gw), 0.0)
+            for p in xi
+        )
+
+        bench_weighted_xpts = (
+            BENCH1_WEIGHT
+            * gw_xpts.get((b1["id"], gw), 0.0)
+            + BENCH2_WEIGHT
+            * gw_xpts.get((b2["id"], gw), 0.0)
+            + BENCH3_WEIGHT
+            * gw_xpts.get((b3["id"], gw), 0.0)
+            + RESERVE_GK_WEIGHT
+            * gw_xpts.get((rgk["id"], gw), 0.0)
+        )
+
+        xi_total += xi_xpts
+        weighted_bench_total += bench_weighted_xpts
+
         weekly_lineups.append({
             "gameweek": gw,
-            "formation": "-".join(str(sum(1 for p in xi if p["position_id"] == pos)) for pos in (2, 3, 4)),
-            "xi_xpts": round(sum(gw_xpts.get((p["id"], gw), 0.0) for p in xi), 3),
+            "formation": "-".join(
+                str(
+                    sum(
+                        1 for p in xi
+                        if p["position_id"] == pos
+                    )
+                )
+                for pos in (2, 3, 4)
+            ),
+            "xi_xpts": round(xi_xpts, 3),
+            "weighted_bench_xpts": round(
+                bench_weighted_xpts, 3
+            ),
             "starting_xi": [
                 {
-                    "id": p["id"], "name": p["name"], "team": p["team"],
-                    "position": p["position"], "price": p["price"],
-                    "xpts": gw_xpts.get((p["id"], gw), 0.0),
-                } for p in xi
+                    "id": p["id"],
+                    "name": p["name"],
+                    "team": p["team"],
+                    "position": p["position"],
+                    "price": p["price"],
+                    "xpts": gw_xpts.get(
+                        (p["id"], gw), 0.0
+                    ),
+                }
+                for p in xi
+            ],
+            "bench": [
+                {
+                    "order": 1,
+                    "role": "bench_1",
+                    "weight": BENCH1_WEIGHT,
+                    "id": b1["id"],
+                    "name": b1["name"],
+                    "team": b1["team"],
+                    "position": b1["position"],
+                    "price": b1["price"],
+                    "xpts": gw_xpts.get(
+                        (b1["id"], gw), 0.0
+                    ),
+                },
+                {
+                    "order": 2,
+                    "role": "bench_2",
+                    "weight": BENCH2_WEIGHT,
+                    "id": b2["id"],
+                    "name": b2["name"],
+                    "team": b2["team"],
+                    "position": b2["position"],
+                    "price": b2["price"],
+                    "xpts": gw_xpts.get(
+                        (b2["id"], gw), 0.0
+                    ),
+                },
+                {
+                    "order": 3,
+                    "role": "bench_3",
+                    "weight": BENCH3_WEIGHT,
+                    "id": b3["id"],
+                    "name": b3["name"],
+                    "team": b3["team"],
+                    "position": b3["position"],
+                    "price": b3["price"],
+                    "xpts": gw_xpts.get(
+                        (b3["id"], gw), 0.0
+                    ),
+                },
+                {
+                    "order": 4,
+                    "role": "reserve_gk",
+                    "weight": RESERVE_GK_WEIGHT,
+                    "id": rgk["id"],
+                    "name": rgk["name"],
+                    "team": rgk["team"],
+                    "position": rgk["position"],
+                    "price": rgk["price"],
+                    "xpts": gw_xpts.get(
+                        (rgk["id"], gw), 0.0
+                    ),
+                },
             ],
         })
 
-    gw1_xi = [p for p in squad if starting[(p["id"], start_gw)].value() == 1]
+    gw1_lineup = next(
+        row for row in weekly_lineups
+        if row["gameweek"] == start_gw
+    )
+
+    gw1_xi_ids = {
+        p["id"]
+        for p in squad
+        if starting[(p["id"], start_gw)].value() == 1
+    }
+
     vice_candidates = sorted(
-        [p for p in gw1_xi if p["id"] != captain_player["id"]],
-        key=lambda p: gw_xpts.get((p["id"], start_gw), 0.0), reverse=True,
+        [
+            p for p in squad
+            if (
+                p["id"] in gw1_xi_ids
+                and p["id"] != captain_player["id"]
+            )
+        ],
+        key=lambda p: gw_xpts.get(
+            (p["id"], start_gw), 0.0
+        ),
+        reverse=True,
     )
-    vice_player = vice_candidates[0] if vice_candidates else captain_player
 
-    bench = [p for p in squad if starting[(p["id"], start_gw)].value() != 1]
-    bench_gk = [p for p in bench if p["position_id"] == 1]
-    bench_outfield = sorted(
-        [p for p in bench if p["position_id"] != 1],
-        key=lambda p: gw_xpts.get((p["id"], start_gw), 0.0), reverse=True,
+    vice_player = (
+        vice_candidates[0]
+        if vice_candidates
+        else captain_player
     )
-    ordered_bench = bench_outfield + bench_gk
 
-    xi_total = sum(
-        gw_xpts.get((p["id"], gw), 0.0)
-        for p in squad for gw in gameweeks
-        if starting[(p["id"], gw)].value() == 1
+    captain_bonus = gw_xpts.get(
+        (captain_player["id"], start_gw),
+        0.0,
     )
-    captain_bonus = gw_xpts.get((captain_player["id"], start_gw), 0.0)
 
-    squad.sort(key=lambda x: (x["position_id"], -x["total_xpts"]))
+    objective_xpts = (
+        xi_total
+        + weighted_bench_total
+        + captain_bonus
+    )
+
+    squad.sort(
+        key=lambda x: (
+            x["position_id"],
+            -x["total_xpts"],
+        )
+    )
 
     return {
-        "optimizer_version": "1.4-current-availability",
+        "optimizer_version": "1.5-bench-weighted",
         "projection_model": MODEL_VERSION_V3,
-        "objective": "maximise expected starting-XI points across horizon plus GW1 captaincy",
+        "objective": (
+            "maximise weighted expected FPL points across the "
+            "horizon: XI 1.00, bench1 0.30, bench2 0.10, "
+            "bench3 0.03, reserve GK 0.03, plus GW1 captaincy"
+        ),
         "constraints": {
-            "budget": budget, "squad_size": 15, "goalkeepers": 2,
-            "defenders": 5, "midfielders": 5, "forwards": 3,
+            "budget": budget,
+            "squad_size": 15,
+            "goalkeepers": 2,
+            "defenders": 5,
+            "midfielders": 5,
+            "forwards": 3,
             "max_per_club": 3,
             "legal_xi_each_gameweek": True,
+            "ordered_outfield_bench_each_gameweek": True,
+            "reserve_gk_each_gameweek": True,
         },
         "assumptions": {
-            "expected_minutes_mode": "auto from historical availability" if expected_minutes <= 0 else "manual override",
-            "manual_expected_minutes": None if expected_minutes <= 0 else expected_minutes,
+            "expected_minutes_mode": (
+                "auto from historical availability"
+                if expected_minutes <= 0
+                else "manual override"
+            ),
+            "manual_expected_minutes": (
+                None
+                if expected_minutes <= 0
+                else expected_minutes
+            ),
             "rate_shrinkage_minutes": 900,
-            "start_gw": start_gw, "horizon": horizon,
-            "bench_points_in_objective": False,
+            "start_gw": start_gw,
+            "horizon": horizon,
+            "bench_points_in_objective": True,
+            "bench_weights": {
+                "bench_1": BENCH1_WEIGHT,
+                "bench_2": BENCH2_WEIGHT,
+                "bench_3": BENCH3_WEIGHT,
+                "reserve_gk": RESERVE_GK_WEIGHT,
+            },
+            "bench_order_optimised_each_gameweek": True,
             "gw1_captaincy": True,
             "vice_captain_optimised": False,
-            "bench_order_method": "GW1 xPts descending for outfield, reserve GK last",
+            "vice_captain_method":
+                "highest GW1 xPts among non-captain starters",
             "player_specific_minutes": expected_minutes <= 0,
-            "historical_player_matching": "persistent FPL player code",
+            "historical_player_matching":
+                "persistent FPL player code",
             "current_availability_adjustment": True,
-            "availability_source": "live FPL status/chance_of_playing_next_round/news",
+            "availability_source":
+                "live FPL status/chance_of_playing_next_round/news",
         },
         "candidate_count": len(candidates),
         "total_cost": round(total_cost, 1),
-        "money_remaining": round(budget - total_cost, 1),
-        "projected_xi_xpts": round(xi_total, 3),
-        "gw1_captain_bonus_xpts": round(captain_bonus, 3),
-        "objective_xpts": round(xi_total + captain_bonus, 3),
+        "money_remaining": round(
+            budget - total_cost, 1
+        ),
+        "projected_xi_xpts": round(
+            xi_total, 3
+        ),
+        "weighted_bench_xpts": round(
+            weighted_bench_total, 3
+        ),
+        "gw1_captain_bonus_xpts": round(
+            captain_bonus, 3
+        ),
+        "objective_xpts": round(
+            objective_xpts, 3
+        ),
         "gw1": {
-            "captain": {"id": captain_player["id"], "name": captain_player["name"], "xpts": gw_xpts.get((captain_player["id"], start_gw), 0.0)},
-            "vice_captain": {"id": vice_player["id"], "name": vice_player["name"], "xpts": gw_xpts.get((vice_player["id"], start_gw), 0.0)},
-            "bench": [
-                {"order": i + 1, "id": p["id"], "name": p["name"], "position": p["position"], "xpts": gw_xpts.get((p["id"], start_gw), 0.0)}
-                for i, p in enumerate(ordered_bench)
-            ],
+            "captain": {
+                "id": captain_player["id"],
+                "name": captain_player["name"],
+                "xpts": gw_xpts.get(
+                    (captain_player["id"], start_gw),
+                    0.0,
+                ),
+            },
+            "vice_captain": {
+                "id": vice_player["id"],
+                "name": vice_player["name"],
+                "xpts": gw_xpts.get(
+                    (vice_player["id"], start_gw),
+                    0.0,
+                ),
+            },
+            "bench": gw1_lineup["bench"],
         },
         "weekly_lineups": weekly_lineups,
         "squad": squad,
