@@ -1778,6 +1778,45 @@ def estimate_expected_minutes(historical, default_minutes=75.0):
     return round(max(0.0, min(90.0, estimate)), 1)
 
 
+
+def adjust_minutes_for_current_availability(player, baseline_minutes):
+    """
+    V1.4: adjust baseline expected minutes using live FPL availability.
+
+    Historical availability remains the baseline. Current injury,
+    suspension and chance-of-playing information can reduce it.
+    """
+    status = player.get("status", "a")
+    chance = player.get("chance_of_playing_next_round")
+    news = player.get("news", "") or ""
+
+    baseline_minutes = max(0.0, min(float(baseline_minutes), 90.0))
+    adjusted_minutes = baseline_minutes
+    adjustment_reason = "no current adjustment"
+
+    # Clearly unavailable / not selectable statuses.
+    if status in {"i", "s", "u", "n"}:
+        adjusted_minutes = 0.0
+        adjustment_reason = f"FPL status '{status}' - unavailable"
+
+    # FPL may publish an explicit probability for a flagged player.
+    elif chance is not None:
+        try:
+            probability = max(0.0, min(float(chance), 100.0)) / 100.0
+            adjusted_minutes = baseline_minutes * probability
+            adjustment_reason = f"FPL chance of playing: {chance}%"
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "baseline_minutes": round(baseline_minutes, 1),
+        "expected_minutes": round(adjusted_minutes, 1),
+        "status": status,
+        "chance_of_playing_next_round": chance,
+        "news": news,
+        "adjustment_reason": adjustment_reason,
+    }
+
 def calculate_core_projection(
     position_id,
     xg_per90,
@@ -2320,68 +2359,7 @@ def get_historical_lookup_by_code(
 
     return lookup
 
-def adjust_minutes_for_current_availability(
-    player,
-    baseline_minutes,
-):
-    """
-    Adjust baseline expected minutes using current FPL
-    availability information.
 
-    Historical availability remains the baseline.
-    Current injury/suspension information can reduce it.
-    """
-
-    status = player.get("status", "a")
-
-    chance = player.get(
-        "chance_of_playing_next_round"
-    )
-
-    news = player.get("news", "") or ""
-
-    adjusted_minutes = baseline_minutes
-    adjustment_reason = "no current adjustment"
-
-    # Definitely unavailable
-    if status in {"i", "s", "u"}:
-        adjusted_minutes = 0.0
-        adjustment_reason = (
-            f"FPL status '{status}' - unavailable"
-        )
-
-    # Doubtful / flagged player with an explicit
-    # chance-of-playing percentage
-    elif chance is not None:
-        try:
-            probability = float(chance) / 100.0
-
-            adjusted_minutes = (
-                baseline_minutes * probability
-            )
-
-            adjustment_reason = (
-                f"FPL chance of playing: {chance}%"
-            )
-
-        except (TypeError, ValueError):
-            pass
-
-    return {
-        "baseline_minutes": round(
-            baseline_minutes,
-            1,
-        ),
-        "expected_minutes": round(
-            adjusted_minutes,
-            1,
-        ),
-        "status": status,
-        "chance_of_playing_next_round": chance,
-        "news": news,
-        "adjustment_reason": adjustment_reason,
-    }
-    
 def project_player_for_optimizer(
     player,
     current,
@@ -2423,11 +2401,17 @@ def project_player_for_optimizer(
     if rates is None:
         return None
 
-    model_expected_minutes = (
+    baseline_expected_minutes = (
         estimate_expected_minutes(historical)
         if expected_minutes <= 0
         else expected_minutes
     )
+
+    availability = adjust_minutes_for_current_availability(
+        player=player,
+        baseline_minutes=baseline_expected_minutes,
+    )
+    model_expected_minutes = availability["expected_minutes"]
 
     current_teams = {
         t["id"]: t["name"]
@@ -2516,6 +2500,7 @@ def project_player_for_optimizer(
         "position_id": player["element_type"],
         "price": player["now_cost"] / 10,
         "expected_minutes": model_expected_minutes,
+        "availability": availability,
         "historical_minutes": rates["minutes"],
         "rate_reliability": round(rates["reliability_weight"], 3),
         "total_xpts": round(total_xpts, 3),
@@ -2545,7 +2530,10 @@ def optimize_squad(
 
     candidates = []
     for player in current["elements"]:
-        if player.get("status") != "a":
+        # V1.4 allows doubtful/flagged players into the candidate pool so
+        # their live chance-of-playing can reduce expected minutes. Clearly
+        # unavailable players remain excluded.
+        if player.get("status") in {"i", "s", "u", "n"}:
             continue
         if player.get("can_select") is False:
             continue
@@ -2678,7 +2666,7 @@ def optimize_squad(
     squad.sort(key=lambda x: (x["position_id"], -x["total_xpts"]))
 
     return {
-        "optimizer_version": "1.3-xi-captain",
+        "optimizer_version": "1.4-current-availability",
         "projection_model": MODEL_VERSION_V3,
         "objective": "maximise expected starting-XI points across horizon plus GW1 captaincy",
         "constraints": {
@@ -2698,6 +2686,8 @@ def optimize_squad(
             "bench_order_method": "GW1 xPts descending for outfield, reserve GK last",
             "player_specific_minutes": expected_minutes <= 0,
             "historical_player_matching": "persistent FPL player code",
+            "current_availability_adjustment": True,
+            "availability_source": "live FPL status/chance_of_playing_next_round/news",
         },
         "candidate_count": len(candidates),
         "total_cost": round(total_cost, 1),
