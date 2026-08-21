@@ -1682,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.3-core-fpl-prob-appearance"
+MODEL_VERSION_V3 = "3.4-core-fpl-fixture-bonus"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -2032,9 +2032,10 @@ def calculate_core_projection(
     clean_sheet_multiplier=1.0,
     fixture_clean_sheet_probability=None,
     save_multiplier=1.0,
+    bonus_fixture_adjustment=True,
 ):
     """
-    V3.3 expected FPL points for one fixture.
+    V3.4 expected FPL points for one fixture.
 
     Attack is adjusted for opponent defensive weakness.
 
@@ -2043,8 +2044,9 @@ def calculate_core_projection(
 
     Goalkeeper saves are fixture-adjusted using opponent
     venue-specific attacking strength. Defensive contributions
-    and bonus still use historical per-90 rates without fixture
-    adjustment. Appearance and clean-sheet eligibility use a probabilistic
+    while defensive contributions remain unadjusted. Bonus starts from the
+    shrunk historical bonus/90 baseline and is adjusted by a bounded,
+    position-aware fixture multiplier. Appearance and clean-sheet eligibility use a probabilistic
     60-minute model rather than a hard expected-minutes threshold.
     """
 
@@ -2133,10 +2135,47 @@ def calculate_core_projection(
 
     defcon_xpts = 0.0
 
-    bonus_xpts = (
-        bonus_per90
-        * minutes_factor
-    )
+    # V3.4: fixture-adjust bonus while retaining historical bonus/90 as
+    # the player-specific baseline. The multiplier uses the parts of the
+    # fixture environment most relevant to each position and is deliberately
+    # capped to avoid bonus overwhelming the core scoring model.
+    base_bonus_xpts = bonus_per90 * minutes_factor
+
+    if bonus_fixture_adjustment:
+        cs_baseline = max(0.05, min(float(clean_sheets_per90), 0.95))
+        cs_bonus_multiplier = cs_probability / cs_baseline
+        cs_bonus_multiplier = max(0.65, min(cs_bonus_multiplier, 1.35))
+        attack_bonus_multiplier = max(0.65, min(float(attack_multiplier), 1.35))
+        save_bonus_multiplier = max(0.65, min(float(save_multiplier), 1.35))
+
+        if position_id == 1:
+            raw_bonus_multiplier = (
+                0.70 * cs_bonus_multiplier
+                + 0.30 * save_bonus_multiplier
+            )
+            bonus_basis = "70% clean-sheet outlook + 30% save pressure"
+        elif position_id == 2:
+            raw_bonus_multiplier = (
+                0.55 * attack_bonus_multiplier
+                + 0.45 * cs_bonus_multiplier
+            )
+            bonus_basis = "55% attacking fixture + 45% clean-sheet outlook"
+        elif position_id == 3:
+            raw_bonus_multiplier = (
+                0.85 * attack_bonus_multiplier
+                + 0.15 * cs_bonus_multiplier
+            )
+            bonus_basis = "85% attacking fixture + 15% clean-sheet outlook"
+        else:
+            raw_bonus_multiplier = attack_bonus_multiplier
+            bonus_basis = "attacking fixture strength"
+
+        bonus_multiplier = max(0.65, min(raw_bonus_multiplier, 1.35))
+    else:
+        bonus_multiplier = 1.0
+        bonus_basis = "historical bonus/90 only"
+
+    bonus_xpts = base_bonus_xpts * bonus_multiplier
 
     total_xpts = (
         appearance_xpts
@@ -2189,6 +2228,15 @@ def calculate_core_projection(
 
         "defcon_xpts":
             round(defcon_xpts, 3),
+
+        "base_bonus_xpts":
+            round(base_bonus_xpts, 3),
+
+        "bonus_multiplier":
+            round(bonus_multiplier, 3),
+
+        "bonus_basis":
+            bonus_basis,
 
         "bonus_xpts":
             round(bonus_xpts, 3),
@@ -2545,7 +2593,7 @@ def player_projection_v3(
             "save_fixture_adjustment":
                 True,
             "bonus_fixture_adjustment":
-                False,
+                True,
             "defcon_fixture_adjustment":
                 False,
         },
