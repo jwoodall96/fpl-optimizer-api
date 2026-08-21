@@ -253,21 +253,19 @@ def historical_players(
     limit: int = 50,
 ):
     """
-    Return archived player data for a previous FPL season.
+    Search archived FPL player data for a previous season.
     Example season: 2025-26
     """
     limit = max(1, min(limit, 100))
 
-    url = (
-        f"{HISTORICAL_BASE}/{season}/players_raw.csv"
-    )
+    url = f"{HISTORICAL_BASE}/{season}/players_raw.csv"
 
     response = requests.get(url, timeout=30)
 
     if response.status_code == 404:
         raise HTTPException(
             status_code=404,
-            detail=f"Historical data not found for season {season}"
+            detail=f"Historical data not found for season {season}",
         )
 
     response.raise_for_status()
@@ -276,14 +274,18 @@ def historical_players(
     import io
 
     rows = list(
-        csv.DictReader(io.StringIO(response.text))
+        csv.DictReader(
+            io.StringIO(
+                response.content.decode("utf-8")
+            )
+        )
     )
 
     result = []
 
     for p in rows:
 
-        # Search player name
+        # Optional player-name search
         if player:
             search_name = player.lower()
 
@@ -300,22 +302,29 @@ def historical_players(
             ):
                 continue
 
-        # Filter position
+        # Optional position filter
         if position is not None:
             try:
-                if int(p.get("element_type", 0)) != position:
-                    continue
-            except ValueError:
+                player_position = int(
+                    p.get("element_type", 0) or 0
+                )
+            except (TypeError, ValueError):
+                player_position = 0
+
+            if player_position != position:
                 continue
 
-        # Filter minimum minutes
+        # Optional minimum-minutes filter
         try:
-            minutes = int(float(p.get("minutes", 0) or 0))
-        except ValueError:
+            minutes = int(
+                float(p.get("minutes", 0) or 0)
+            )
+        except (TypeError, ValueError):
             minutes = 0
 
         if minutes < min_minutes:
             continue
+
         result.append({
             "id": p.get("id"),
             "first_name": p.get("first_name"),
@@ -338,7 +347,8 @@ def historical_players(
             "bonus": p.get("bonus"),
             "bps": p.get("bps"),
         })
-            allowed_sort_fields = {
+
+    allowed_sort_fields = {
         "minutes",
         "total_points",
         "goals_scored",
@@ -366,13 +376,21 @@ def historical_players(
 
     result.sort(
         key=historical_sort_value,
-        reverse=reverse
+        reverse=reverse,
     )
 
     result = result[:limit]
-    
+
     return {
         "season": season,
         "count": len(result),
+        "filters": {
+            "player": player,
+            "position": position,
+            "min_minutes": min_minutes,
+            "sort_by": sort_by,
+            "order": order,
+            "limit": limit,
+        },
         "players": result,
     }
