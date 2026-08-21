@@ -2204,3 +2204,344 @@ def player_projection_v3(
                 round(total_xpts, 3),
         },
     }
+
+# ============================================================
+# SQUAD OPTIMISER V1
+# ============================================================
+
+from pulp import (
+    LpProblem,
+    LpMaximize,
+    LpVariable,
+    lpSum,
+    LpBinary,
+    PULP_CBC_CMD,
+    LpStatus,
+)
+
+
+def project_player_for_optimizer(
+    player,
+    current,
+    history_lookup,
+    strength_lookup,
+    expected_minutes=75,
+    start_gw=1,
+    horizon=6,
+):
+    """
+    Produce V3-style total xPts for one player without
+    making an internal HTTP call to our own API.
+    """
+
+    historical = history_lookup.get(
+        player["web_name"].strip().lower()
+    )
+
+    if historical is None:
+        return None
+
+    rates = get_historical_player_rates(
+        historical
+    )
+
+    if rates is None:
+        return None
+
+    current_teams = {
+        t["id"]: t["name"]
+        for t in current["teams"]
+    }
+
+    fixtures = get_player_fixtures(
+        player["team"],
+        start_gw=start_gw,
+        horizon=horizon,
+    )
+
+    if not fixtures:
+        return None
+
+    gw_projections = []
+
+    for fixture in fixtures:
+
+        opponent_name = current_teams.get(
+            fixture["opponent_id"]
+        )
+
+        opponent_strength = (
+            strength_lookup.get(
+                opponent_name.strip().lower()
+            )
+            if opponent_name
+            else None
+        )
+
+        if opponent_strength:
+
+            if fixture["home"]:
+                attack_multiplier = (
+                    opponent_strength[
+                        "away_defence_weakness"
+                    ]
+                )
+            else:
+                attack_multiplier = (
+                    opponent_strength[
+                        "home_defence_weakness"
+                    ]
+                )
+
+        else:
+            attack_multiplier = (
+                PROMOTED_DEFENCE_WEAKNESS
+            )
+
+        projection = calculate_core_projection(
+            position_id=player["element_type"],
+            xg_per90=rates["xg_per90"],
+            xa_per90=rates["xa_per90"],
+            clean_sheets_per90=
+                rates["clean_sheets_per90"],
+            saves_per90=rates["saves_per90"],
+            bonus_per90=rates["bonus_per90"],
+            defcon_points_per90=
+                rates["defcon_points_per90"],
+            expected_minutes=expected_minutes,
+            attack_multiplier=attack_multiplier,
+            clean_sheet_multiplier=1.0,
+        )
+
+        gw_projections.append({
+            "gameweek": fixture["gameweek"],
+            "opponent": opponent_name,
+            "home": fixture["home"],
+            "xpts": projection["total_xpts"],
+        })
+
+    total_xpts = sum(
+        gw["xpts"]
+        for gw in gw_projections
+    )
+
+    return {
+        "id": player["id"],
+        "name": player["web_name"],
+        "team_id": player["team"],
+        "team": current_teams.get(
+            player["team"]
+        ),
+        "position_id": player["element_type"],
+        "price": player["now_cost"] / 10,
+        "expected_minutes": expected_minutes,
+        "total_xpts": round(total_xpts, 3),
+        "gw_projections": gw_projections,
+    }
+
+
+@app.get("/optimize-squad")
+def optimize_squad(
+    budget: float = 100.0,
+    expected_minutes: float = 75,
+    start_gw: int = 1,
+    horizon: int = 6,
+):
+    """
+    Find the highest projected legal 15-player FPL squad.
+
+    V1 objective:
+    maximise total projected squad xPts over the horizon.
+
+    This does NOT yet optimise:
+    starting XI, captaincy, bench weighting or
+    player-specific expected minutes.
+    """
+
+    horizon = max(1, min(horizon, 10))
+
+    current = get_bootstrap()
+
+    history_lookup = get_historical_lookup()
+
+    strength_lookup = (
+        get_historical_team_strength_lookup()
+    )
+
+    candidates = []
+
+    for player in current["elements"]:
+
+        # Only currently available players.
+        if player.get("status") != "a":
+            continue
+
+        # Avoid players FPL says cannot currently be selected.
+        if player.get("can_select") is False:
+            continue
+
+        projection = project_player_for_optimizer(
+            player=player,
+            current=current,
+            history_lookup=history_lookup,
+            strength_lookup=strength_lookup,
+            expected_minutes=expected_minutes,
+            start_gw=start_gw,
+            horizon=horizon,
+        )
+
+        if projection is not None:
+            candidates.append(projection)
+
+    if not candidates:
+        raise HTTPException(
+            status_code=500,
+            detail="No projection candidates available",
+        )
+
+    problem = LpProblem(
+        "FPL_Squad_Optimizer",
+        LpMaximize,
+    )
+
+    selected = {
+        p["id"]: LpVariable(
+            f"player_{p['id']}",
+            cat=LpBinary,
+        )
+        for p in candidates
+    }
+
+    # Objective
+    problem += lpSum(
+        selected[p["id"]] * p["total_xpts"]
+        for p in candidates
+    )
+
+    # Exactly 15 players
+    problem += lpSum(
+        selected[p["id"]]
+        for p in candidates
+    ) == 15
+
+    # Budget
+    problem += lpSum(
+        selected[p["id"]] * p["price"]
+        for p in candidates
+    ) <= budget
+
+    # Position constraints
+    position_requirements = {
+        1: 2,  # GK
+        2: 5,  # DEF
+        3: 5,  # MID
+        4: 3,  # FWD
+    }
+
+    for position_id, required in (
+        position_requirements.items()
+    ):
+        problem += lpSum(
+            selected[p["id"]]
+            for p in candidates
+            if p["position_id"] == position_id
+        ) == required
+
+    # Maximum 3 per club
+    team_ids = {
+        p["team_id"]
+        for p in candidates
+    }
+
+    for team_id in team_ids:
+        problem += lpSum(
+            selected[p["id"]]
+            for p in candidates
+            if p["team_id"] == team_id
+        ) <= 3
+
+    problem.solve(
+        PULP_CBC_CMD(msg=False)
+    )
+
+    status = LpStatus[problem.status]
+
+    if status != "Optimal":
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Optimizer did not find an "
+                f"optimal squad: {status}"
+            ),
+        )
+
+    squad = [
+        p
+        for p in candidates
+        if selected[p["id"]].value() == 1
+    ]
+
+    squad.sort(
+        key=lambda x: (
+            x["position_id"],
+            -x["total_xpts"],
+        )
+    )
+
+    total_cost = sum(
+        p["price"]
+        for p in squad
+    )
+
+    total_xpts = sum(
+        p["total_xpts"]
+        for p in squad
+    )
+
+    position_names = {
+        1: "GK",
+        2: "DEF",
+        3: "MID",
+        4: "FWD",
+    }
+
+    for p in squad:
+        p["position"] = position_names.get(
+            p["position_id"]
+        )
+
+    return {
+        "optimizer_version": "1.0",
+        "projection_model": MODEL_VERSION_V3,
+        "objective":
+            "maximise total squad xPts",
+        "constraints": {
+            "budget": budget,
+            "squad_size": 15,
+            "goalkeepers": 2,
+            "defenders": 5,
+            "midfielders": 5,
+            "forwards": 3,
+            "max_per_club": 3,
+        },
+        "assumptions": {
+            "expected_minutes_per_player_per_fixture":
+                expected_minutes,
+            "start_gw": start_gw,
+            "horizon": horizon,
+            "bench_weighting": False,
+            "captaincy": False,
+            "player_specific_minutes": False,
+        },
+        "candidate_count": len(candidates),
+        "total_cost": round(total_cost, 1),
+        "money_remaining": round(
+            budget - total_cost,
+            1,
+        ),
+        "total_squad_xpts": round(
+            total_xpts,
+            3,
+        ),
+        "squad": squad,
+    }
