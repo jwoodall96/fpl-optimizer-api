@@ -2613,7 +2613,7 @@ def player_projection_v3(
     }
 
 # ============================================================
-# SQUAD OPTIMISER V1.5 - BENCH-WEIGHTED
+# SQUAD OPTIMISER V1.6 - MULTI-WEEK CAPTAINCY
 # ============================================================
 
 from pulp import (
@@ -2831,14 +2831,14 @@ def optimize_squad(
     horizon: int = 6,
 ):
     """
-    V1.5 bench-weighted squad optimiser.
+    V1.6 bench-weighted squad optimiser with multi-week captaincy.
 
     Optimises:
     - legal 15-player FPL squad
     - legal starting XI independently in every GW
     - ordered outfield bench independently in every GW
     - reserve goalkeeper independently in every GW
-    - GW1 captaincy
+    - captain independently in every GW
 
     Objective weights:
     XI = 1.00
@@ -2904,7 +2904,7 @@ def optimize_squad(
     }
 
     problem = LpProblem(
-        "FPL_Bench_Weighted_Optimizer",
+        "FPL_Bench_Weighted_Multiweek_Captaincy_Optimizer",
         LpMaximize,
     )
 
@@ -2962,11 +2962,12 @@ def optimize_squad(
     }
 
     captain = {
-        p["id"]: LpVariable(
-            f"captain_{p['id']}",
+        (p["id"], gw): LpVariable(
+            f"captain_{p['id']}_{gw}",
             cat=LpBinary,
         )
         for p in candidates
+        for gw in gameweeks
     }
 
     XI_WEIGHT = 1.00
@@ -2976,7 +2977,7 @@ def optimize_squad(
     RESERVE_GK_WEIGHT = 0.03
 
     # Weighted expected points from every weekly squad role,
-    # plus one extra copy of the GW1 captain's points.
+    # plus one extra copy of each gameweek captain's points.
     problem += (
         lpSum(
             XI_WEIGHT
@@ -3014,9 +3015,10 @@ def optimize_squad(
             for gw in gameweeks
         )
         + lpSum(
-            captain[p["id"]]
-            * gw_xpts.get((p["id"], start_gw), 0.0)
+            captain[(p["id"], gw)]
+            * gw_xpts.get((p["id"], gw), 0.0)
             for p in candidates
+            for gw in gameweeks
         )
     )
 
@@ -3195,20 +3197,20 @@ def optimize_squad(
             <= 3
         )
 
-    # Exactly one GW1 captain, and the captain must start.
-    problem += (
-        lpSum(
-            captain[p["id"]]
-            for p in candidates
-        )
-        == 1
-    )
-
-    for p in candidates:
+        # Exactly one captain in every GW, and the captain must start.
         problem += (
-            captain[p["id"]]
-            <= starting[(p["id"], start_gw)]
+            lpSum(
+                captain[(p["id"], gw)]
+                for p in candidates
+            )
+            == 1
         )
+
+        for p in candidates:
+            problem += (
+                captain[(p["id"], gw)]
+                <= starting[(p["id"], gw)]
+            )
 
     problem.solve(PULP_CBC_CMD(msg=False))
 
@@ -3243,15 +3245,11 @@ def optimize_squad(
         p["price"] for p in squad
     )
 
-    captain_player = next(
-        p for p in squad
-        if captain[p["id"]].value() == 1
-    )
-
     weekly_lineups = []
 
     xi_total = 0.0
     weighted_bench_total = 0.0
+    captain_bonus_total = 0.0
 
     for gw in gameweeks:
 
@@ -3284,6 +3282,11 @@ def optimize_squad(
             if reserve_gk[(p["id"], gw)].value() == 1
         )
 
+        captain_player = next(
+            p for p in squad
+            if captain[(p["id"], gw)].value() == 1
+        )
+
         xi_xpts = sum(
             gw_xpts.get((p["id"], gw), 0.0)
             for p in xi
@@ -3300,8 +3303,14 @@ def optimize_squad(
             * gw_xpts.get((rgk["id"], gw), 0.0)
         )
 
+        captain_bonus = gw_xpts.get(
+            (captain_player["id"], gw),
+            0.0,
+        )
+
         xi_total += xi_xpts
         weighted_bench_total += bench_weighted_xpts
+        captain_bonus_total += captain_bonus
 
         weekly_lineups.append({
             "gameweek": gw,
@@ -3318,6 +3327,12 @@ def optimize_squad(
             "weighted_bench_xpts": round(
                 bench_weighted_xpts, 3
             ),
+            "captain_bonus_xpts": round(captain_bonus, 3),
+            "captain": {
+                "id": captain_player["id"],
+                "name": captain_player["name"],
+                "xpts": gw_xpts.get((captain_player["id"], gw), 0.0),
+            },
             "starting_xi": [
                 {
                     "id": p["id"],
@@ -3392,6 +3407,11 @@ def optimize_squad(
         if row["gameweek"] == start_gw
     )
 
+    gw1_captain_player = next(
+        p for p in squad
+        if captain[(p["id"], start_gw)].value() == 1
+    )
+
     gw1_xi_ids = {
         p["id"]
         for p in squad
@@ -3403,7 +3423,7 @@ def optimize_squad(
             p for p in squad
             if (
                 p["id"] in gw1_xi_ids
-                and p["id"] != captain_player["id"]
+                and p["id"] != gw1_captain_player["id"]
             )
         ],
         key=lambda p: gw_xpts.get(
@@ -3415,18 +3435,18 @@ def optimize_squad(
     vice_player = (
         vice_candidates[0]
         if vice_candidates
-        else captain_player
+        else gw1_captain_player
     )
 
-    captain_bonus = gw_xpts.get(
-        (captain_player["id"], start_gw),
+    gw1_captain_bonus = gw_xpts.get(
+        (gw1_captain_player["id"], start_gw),
         0.0,
     )
 
     objective_xpts = (
         xi_total
         + weighted_bench_total
-        + captain_bonus
+        + captain_bonus_total
     )
 
     squad.sort(
@@ -3437,12 +3457,12 @@ def optimize_squad(
     )
 
     return {
-        "optimizer_version": "1.5-bench-weighted",
+        "optimizer_version": "1.6-multiweek-captaincy",
         "projection_model": MODEL_VERSION_V3,
         "objective": (
             "maximise weighted expected FPL points across the "
             "horizon: XI 1.00, bench1 0.30, bench2 0.10, "
-            "bench3 0.03, reserve GK 0.03, plus GW1 captaincy"
+            "bench3 0.03, reserve GK 0.03, plus captaincy in every gameweek"
         ),
         "constraints": {
             "budget": budget,
@@ -3478,7 +3498,7 @@ def optimize_squad(
                 "reserve_gk": RESERVE_GK_WEIGHT,
             },
             "bench_order_optimised_each_gameweek": True,
-            "gw1_captaincy": True,
+            "captaincy_each_gameweek": True,
             "vice_captain_optimised": False,
             "vice_captain_method":
                 "highest GW1 xPts among non-captain starters",
@@ -3501,17 +3521,20 @@ def optimize_squad(
             weighted_bench_total, 3
         ),
         "gw1_captain_bonus_xpts": round(
-            captain_bonus, 3
+            gw1_captain_bonus, 3
+        ),
+        "captain_bonus_xpts": round(
+            captain_bonus_total, 3
         ),
         "objective_xpts": round(
             objective_xpts, 3
         ),
         "gw1": {
             "captain": {
-                "id": captain_player["id"],
-                "name": captain_player["name"],
+                "id": gw1_captain_player["id"],
+                "name": gw1_captain_player["name"],
                 "xpts": gw_xpts.get(
-                    (captain_player["id"], start_gw),
+                    (gw1_captain_player["id"], start_gw),
                     0.0,
                 ),
             },
