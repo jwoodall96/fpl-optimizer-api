@@ -2950,6 +2950,7 @@ def project_player_for_optimizer(
                 cs_info["clean_sheet_probability"],
             save_multiplier=
                 cs_info["opponent_attack_strength"],
+            historical_player_id=safe_int(historical.get("id"), -1),
         )
 
         gw_projections.append({
