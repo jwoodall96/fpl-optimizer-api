@@ -1682,8 +1682,110 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.6-core-fpl-2026-bps"
+MODEL_VERSION_V3 = "3.7-core-fpl-empirical-defcon"
 
+
+
+_DEFCON_GW_CACHE = None
+
+def get_empirical_defcon_lookup(season="2025-26", prior_matches=8.0):
+    """Build shrunk match-level DefCon threshold probabilities by historical FPL ID.
+
+    Uses the archived merged gameweek file. Matches with zero minutes are ignored.
+    The observed threshold-hit rate is shrunk toward a player-specific Poisson
+    prior derived from his mean defensive-contribution count, preventing small
+    samples from producing extreme 0%/100% estimates.
+    """
+    global _DEFCON_GW_CACHE
+    if _DEFCON_GW_CACHE is not None:
+        return _DEFCON_GW_CACHE
+
+    import csv
+    import io
+
+    url = f"{HISTORICAL_BASE}/{season}/gws/merged_gw.csv"
+    response = requests.get(url, timeout=45)
+    response.raise_for_status()
+    reader = csv.DictReader(io.StringIO(response.content.decode("utf-8")))
+
+    grouped = {}
+    for row in reader:
+        player_id = safe_int(row.get("element"), -1)
+        minutes = safe_int(row.get("minutes"), 0)
+        if player_id < 0 or minutes <= 0:
+            continue
+        raw = row.get("defensive_contribution")
+        if raw in (None, ""):
+            continue
+        actions = safe_float(raw)
+        bucket = grouped.setdefault(player_id, {"actions": [], "minutes": []})
+        bucket["actions"].append(actions)
+        bucket["minutes"].append(minutes)
+
+    lookup = {}
+    for player_id, bucket in grouped.items():
+        actions = bucket["actions"]
+        n = len(actions)
+        if n == 0:
+            continue
+        lookup[player_id] = {
+            "matches": n,
+            "mean_actions": sum(actions) / n,
+            "actions": actions,
+            "prior_matches": float(prior_matches),
+        }
+
+    _DEFCON_GW_CACHE = lookup
+    return lookup
+
+
+def empirical_defcon_probability(historical_player_id, position_id, expected_minutes, fallback_mean):
+    """Return empirical/shrunk probability of crossing the FPL DefCon threshold."""
+    if position_id == 2:
+        threshold = 10
+    elif position_id in (3, 4):
+        threshold = 12
+    else:
+        return {"probability": 0.0, "source": "not eligible", "matches": 0, "hits": 0}
+
+    # Player-specific Poisson prior, preserving V3.5 as the fallback/regulariser.
+    lam = max(0.0, float(fallback_mean))
+    if lam <= 0:
+        poisson_probability = 0.0
+    else:
+        term = math.exp(-lam)
+        cdf = term
+        for k in range(1, threshold):
+            term *= lam / k
+            cdf += term
+        poisson_probability = max(0.0, min(1.0, 1.0 - cdf))
+
+    try:
+        record = get_empirical_defcon_lookup().get(safe_int(historical_player_id, -1))
+    except Exception:
+        record = None
+
+    if not record or record["matches"] < 5:
+        return {
+            "probability": poisson_probability,
+            "source": "poisson fallback: insufficient match-level history",
+            "matches": 0 if not record else record["matches"],
+            "hits": 0 if not record else sum(1 for x in record["actions"] if x >= threshold),
+        }
+
+    hits = sum(1 for x in record["actions"] if x >= threshold)
+    n = record["matches"]
+    prior_n = record["prior_matches"]
+    shrunk = (hits + prior_n * poisson_probability) / (n + prior_n)
+    return {
+        "probability": max(0.0, min(1.0, shrunk)),
+        "source": "empirical 2025/26 match hit-rate shrunk to player Poisson prior",
+        "matches": n,
+        "hits": hits,
+        "raw_probability": hits / n,
+        "poisson_prior_probability": poisson_probability,
+        "prior_matches": prior_n,
+    }
 
 def clean_sheet_points_for_position(position_id):
     scoring = {
@@ -2033,6 +2135,7 @@ def calculate_core_projection(
     fixture_clean_sheet_probability=None,
     save_multiplier=1.0,
     bonus_fixture_adjustment=True,
+    historical_player_id=None,
 ):
     """
     V3.4 expected FPL points for one fixture.
@@ -2150,19 +2253,25 @@ def calculate_core_projection(
     if defcon_threshold is None or expected_defcon <= 0:
         defcon_probability = 0.0
         defcon_xpts = 0.0
+        defcon_probability_source = "not eligible or zero expected actions"
+        defcon_history_matches = 0
+        defcon_history_hits = 0
+        defcon_raw_probability = None
+        defcon_poisson_prior_probability = None
     else:
-        poisson_term = math.exp(-expected_defcon)
-        poisson_cdf = poisson_term
-
-        for k in range(1, defcon_threshold):
-            poisson_term *= expected_defcon / k
-            poisson_cdf += poisson_term
-
-        defcon_probability = max(
-            0.0,
-            min(1.0, 1.0 - poisson_cdf),
+        empirical = empirical_defcon_probability(
+            historical_player_id=historical_player_id,
+            position_id=position_id,
+            expected_minutes=expected_minutes,
+            fallback_mean=expected_defcon,
         )
+        defcon_probability = empirical["probability"]
         defcon_xpts = 2.0 * defcon_probability
+        defcon_probability_source = empirical["source"]
+        defcon_history_matches = empirical.get("matches", 0)
+        defcon_history_hits = empirical.get("hits", 0)
+        defcon_raw_probability = empirical.get("raw_probability")
+        defcon_poisson_prior_probability = empirical.get("poisson_prior_probability")
 
     # V3.6: translate the 2025/26 historical bonus baseline into the
     # 2026/27 BPS environment before applying the existing fixture multiplier.
@@ -2282,6 +2391,16 @@ def calculate_core_projection(
 
         "defcon_probability":
             round(defcon_probability, 3),
+        "defcon_probability_source":
+            defcon_probability_source,
+        "defcon_history_matches":
+            defcon_history_matches,
+        "defcon_history_hits":
+            defcon_history_hits,
+        "defcon_raw_probability":
+            None if defcon_raw_probability is None else round(defcon_raw_probability, 3),
+        "defcon_poisson_prior_probability":
+            None if defcon_poisson_prior_probability is None else round(defcon_poisson_prior_probability, 3),
 
         "defcon_xpts":
             round(defcon_xpts, 3),
@@ -2509,6 +2628,7 @@ def player_projection_v3(
                 cs_multiplier,
             fixture_clean_sheet_probability=cs_info["clean_sheet_probability"],
             save_multiplier=save_multiplier,
+            historical_player_id=safe_int(historical.get("id"), -1),
         )
 
         projections.append({
