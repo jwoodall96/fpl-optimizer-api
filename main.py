@@ -1682,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.4-core-fpl-fixture-bonus"
+MODEL_VERSION_V3 = "3.5-core-fpl-defcon"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -2126,14 +2126,43 @@ def calculate_core_projection(
         expected_saves = 0.0
         save_xpts = 0.0
 
-    # Defensive contribution is a raw count, not FPL points. 
-    # V3 does not yet convert the threshold-based rule into xPts.
+    # V3.5: convert expected defensive-contribution actions into xPts.
+    # DEF earns 2 points at 10+ CBIT actions; MID/FWD earn 2 points
+    # at 12+ CBIRT actions. Goalkeepers are not eligible.
+    #
+    # Historical data gives us an average action rate rather than a
+    # match-level probability distribution, so model the action count
+    # as Poisson with mean equal to the minutes-adjusted expected count.
+    # This gives a smooth probability of crossing the threshold instead
+    # of incorrectly awarding 0/2 points based only on the mean.
     expected_defcon = (
         defcon_points_per90
         * minutes_factor
     )
 
-    defcon_xpts = 0.0
+    if position_id == 2:
+        defcon_threshold = 10
+    elif position_id in (3, 4):
+        defcon_threshold = 12
+    else:
+        defcon_threshold = None
+
+    if defcon_threshold is None or expected_defcon <= 0:
+        defcon_probability = 0.0
+        defcon_xpts = 0.0
+    else:
+        poisson_term = math.exp(-expected_defcon)
+        poisson_cdf = poisson_term
+
+        for k in range(1, defcon_threshold):
+            poisson_term *= expected_defcon / k
+            poisson_cdf += poisson_term
+
+        defcon_probability = max(
+            0.0,
+            min(1.0, 1.0 - poisson_cdf),
+        )
+        defcon_xpts = 2.0 * defcon_probability
 
     # V3.4: fixture-adjust bonus while retaining historical bonus/90 as
     # the player-specific baseline. The multiplier uses the parts of the
@@ -2225,6 +2254,12 @@ def calculate_core_projection(
             round(save_xpts, 3),
         "expected_defensive_contributions":
             round(expected_defcon, 3),
+
+        "defcon_threshold":
+            defcon_threshold,
+
+        "defcon_probability":
+            round(defcon_probability, 3),
 
         "defcon_xpts":
             round(defcon_xpts, 3),
