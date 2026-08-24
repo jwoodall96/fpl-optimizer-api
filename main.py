@@ -1682,7 +1682,7 @@ def historical_fields(
 # PROJECTION ENGINE V3 - CORE FPL XPTS
 # ============================================================
 
-MODEL_VERSION_V3 = "3.5-core-fpl-defcon"
+MODEL_VERSION_V3 = "3.6-core-fpl-2026-bps"
 
 
 def clean_sheet_points_for_position(position_id):
@@ -2164,11 +2164,33 @@ def calculate_core_projection(
         )
         defcon_xpts = 2.0 * defcon_probability
 
-    # V3.4: fixture-adjust bonus while retaining historical bonus/90 as
-    # the player-specific baseline. The multiplier uses the parts of the
-    # fixture environment most relevant to each position and is deliberately
-    # capped to avoid bonus overwhelming the core scoring model.
-    base_bonus_xpts = bonus_per90 * minutes_factor
+    # V3.6: translate the 2025/26 historical bonus baseline into the
+    # 2026/27 BPS environment before applying the existing fixture multiplier.
+    # Official 2026/27 changes reduce CBI reward (1 BPS per 3 rather than 2),
+    # remove the Being Tackled penalty, and improve goalkeeper save treatment.
+    # We do not have the full event-level BPS ledger here, so use a deliberately
+    # bounded, transparent season-transition adjustment rather than pretending
+    # to reconstruct exact BPS. Defenders with higher projected DefCon pressure
+    # receive the largest reduction because CBI is the explicit overlap FPL
+    # changed; GKs and attacking positions receive small directional uplifts.
+    historical_base_bonus_xpts = bonus_per90 * minutes_factor
+
+    if position_id == 1:
+        bps_2026_adjustment = 1.05
+        bps_2026_basis = "2026/27 GK BPS uplift: revised saves + big-chance saves"
+    elif position_id == 2:
+        # Scale the centre-back/CBI penalty with the probability of reaching
+        # the 10-action DefCon threshold. Maximum reduction is 15%.
+        bps_2026_adjustment = 1.0 - (0.15 * defcon_probability)
+        bps_2026_basis = "2026/27 defender BPS: reduced CBI reward, scaled by DefCon probability"
+    elif position_id in (3, 4):
+        bps_2026_adjustment = 1.03
+        bps_2026_basis = "2026/27 attacking BPS uplift: Being Tackled penalty removed"
+    else:
+        bps_2026_adjustment = 1.0
+        bps_2026_basis = "no 2026/27 BPS adjustment"
+
+    base_bonus_xpts = historical_base_bonus_xpts * bps_2026_adjustment
 
     if bonus_fixture_adjustment:
         cs_baseline = max(0.05, min(float(clean_sheets_per90), 0.95))
@@ -2263,6 +2285,15 @@ def calculate_core_projection(
 
         "defcon_xpts":
             round(defcon_xpts, 3),
+
+        "historical_base_bonus_xpts":
+            round(historical_base_bonus_xpts, 3),
+
+        "bps_2026_adjustment":
+            round(bps_2026_adjustment, 3),
+
+        "bps_2026_basis":
+            bps_2026_basis,
 
         "base_bonus_xpts":
             round(base_bonus_xpts, 3),
